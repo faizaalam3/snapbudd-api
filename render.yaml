@@ -1,0 +1,30 @@
+# Render Blueprint — free Web Service
+# Dashboard: https://dashboard.render.com → New → Blueprint → connect this repo
+services:
+  - type: web
+    name: snapbudd-api
+    runtime: docker
+    plan: free
+    region: frankfurt
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: FIREBASE_PROJECT_ID
+        value: snapbudd-1
+      - key: PLATFORM_FIXED_FEE_NOK
+        value: '29'
+      - key: PLATFORM_PERCENT_FEE
+        value: '0.1'
+      - key: MERCHANT_TRACKING_BASE_URL
+        value: https://snapbudd.io/merchant/track
+      - key: CORS_ORIGINS
+        value: '*'
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: GOOGLE_MAPS_API_KEY
+        sync: false
+      - key: API_BASE_URL
+        sync: false
