@@ -1,11 +1,11 @@
-# Render Blueprint — free Web Service
-# Dashboard: https://dashboard.render.com → New → Blueprint → connect this repo
 services:
   - type: web
     name: snapbudd-api
-    runtime: docker
+    runtime: node
     plan: free
     region: frankfurt
+    buildCommand: npm install && npm run build
+    startCommand: node dist/main.js
     healthCheckPath: /health
     envVars:
       - key: NODE_ENV

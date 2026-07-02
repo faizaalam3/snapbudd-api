@@ -1,23 +1,24 @@
+# Single-stage install — avoids npm ci lockfile issues on some cloud builders
 FROM node:22-slim AS build
 WORKDIR /app
 
-# Explicit copy — glob can miss lockfile on some builders
-COPY package.json package-lock.json ./
+# Install with dev deps first (do not set NODE_ENV=production here)
+ENV NODE_ENV=development
 
-RUN npm ci --no-audit --no-fund
+COPY package.json package-lock.json ./
+RUN npm install --no-audit --no-fund
 
 COPY . .
-RUN npm run build
+RUN npm run build && npm prune --omit=dev
 
-FROM node:22-slim
+FROM node:22-slim AS production
 WORKDIR /app
 ENV NODE_ENV=production
 
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev --no-audit --no-fund
-
+COPY --from=build /app/package.json ./package.json
+COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 
-EXPOSE 3000
 USER node
+EXPOSE 3000
 CMD ["node", "dist/main.js"]
