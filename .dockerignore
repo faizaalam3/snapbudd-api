@@ -1,0 +1,11 @@
+# Keep package-lock.json in Docker / Cloud Build context
+node_modules
+dist
+.git
+.env
+.env.*
+secrets
+coverage
+test
+npm-debug.log*
+.DS_Store
