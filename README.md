@@ -61,7 +61,11 @@ See [docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) for request/response sche
 
 ## Deployment
 
-See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+| Guide | Use when |
+|-------|----------|
+| [`docs/DEPLOY_SNAPBUDD_IO.md`](docs/DEPLOY_SNAPBUDD_IO.md) | **Production** — `api.snapbudd.io` on Google Cloud Run (recommended) |
+| [`docs/DEPLOY_RENDER.md`](docs/DEPLOY_RENDER.md) | Quick free trial on Render |
+| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | General deployment reference |
 
 ## Merchant onboarding flow
 
