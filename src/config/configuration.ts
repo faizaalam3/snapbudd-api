@@ -14,7 +14,7 @@ export default () => ({
   apiBaseUrl: process.env.API_BASE_URL ?? 'http://localhost:3000',
   merchantTrackingBaseUrl:
     process.env.MERCHANT_TRACKING_BASE_URL ??
-    'https://snapbudd.io/merchant/track',
+    'https://snapbudd.io/track',
   corsOrigins: (process.env.CORS_ORIGINS ?? '*')
     .split(',')
     .map((o) => o.trim())

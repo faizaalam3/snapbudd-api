@@ -139,10 +139,14 @@ export class OrdersService {
     }
 
     const orderDoc = {
-      status: 'pending',
+      schemaVersion: 2,
+      status: scheduledAt ? 'scheduled' : 'bidding',
       createdAt: now,
       updatedAt: now,
       scheduledAt: scheduledAt ?? null,
+      creatorType: 'merchant',
+      creatorId: merchant.ownerUid,
+      merchantId: merchant.merchantId,
       source: {
         type: 'merchant',
         merchantId: merchant.merchantId,
@@ -224,6 +228,21 @@ export class OrdersService {
       schedule: {
         isScheduled: scheduledAt != null,
         scheduledAt: scheduledAt ?? null,
+        fulfillmentType: scheduledAt ? 'scheduled' : 'asap',
+      },
+      scheduling: {
+        fulfillmentType: scheduledAt ? 'scheduled' : 'asap',
+        scheduledAt: scheduledAt ?? null,
+      },
+      flags: {
+        isPublic: true,
+        requiresPin: true,
+        hasDispute: false,
+        isArchived: false,
+      },
+      payment: {
+        provider: 'stripe',
+        status: 'pending',
       },
       pricing: {
         ...preview.pricing,
@@ -247,8 +266,10 @@ export class OrdersService {
 
     await merchantSnap.ref.set(
       {
-        'stats.totalOrders': this.firebase.increment(1),
-        'stats.updatedAt': now,
+        stats: {
+          totalOrders: this.firebase.increment(1),
+          updatedAt: now,
+        },
         updatedAt: now,
       },
       { merge: true },
@@ -600,10 +621,13 @@ export class OrdersService {
     return {
       orderId: id,
       status: data.status,
+      schemaVersion: data.schemaVersion ?? 2,
       createdAt: data.createdAt,
       updatedAt: data.updatedAt,
       scheduledAt: data.scheduledAt ?? null,
+      creatorType: data.creatorType ?? readPath(data, 'source.type', 'merchant'),
       merchantId,
+      source: data.source ?? null,
       tracking: {
         token: (tracking.publicToken ?? id).toString(),
         url: this.buildTrackingUrl(
@@ -619,7 +643,13 @@ export class OrdersService {
       dropoff: data.dropoff ?? null,
       shipment: data.shipment ?? null,
       route,
-      pricing: {
+      security: data.security ?? null,
+      ratings: data.ratings ?? null,
+      schedule: data.schedule ?? null,
+      scheduling: data.scheduling ?? null,
+      serviceArea: data.serviceArea ?? null,
+      flags: data.flags ?? null,
+      pricing: data.pricing ?? {
         currency: pricing.currency ?? 'NOK',
         total: pricing.total ?? null,
         negotiatedTotal: pricing.negotiatedTotal ?? null,
@@ -627,10 +657,14 @@ export class OrdersService {
       assignment: {
         driverId: assignment.driverId ?? null,
         driverName: driver.name ?? null,
+        driverPhone: driver.phone ?? null,
         companyId: assignment.companyId ?? null,
         acceptedBidId: assignment.acceptedBidId ?? null,
+        driver: assignment.driver ?? driver,
+        vehicle: assignment.vehicle ?? null,
       },
       timeline,
+      payment: data.payment ?? { status: data.paymentStatus ?? null },
       paymentStatus: data.paymentStatus ?? readPath(data, 'payment.status', null),
     };
   }
