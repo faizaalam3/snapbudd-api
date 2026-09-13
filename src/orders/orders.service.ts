@@ -17,8 +17,16 @@ import { MerchantContext } from '../common/types/merchant-context';
 import { PricingService } from '../pricing/pricing.service';
 import { ServiceAreaService } from '../service-area/service-area.service';
 import { CreateOrderDto } from './dto/orders.dto';
+import {
+  calculateDeliveryDistribution,
+  companyCommissionPercent,
+} from '../common/domain/delivery-finance';
 
-function readPath(obj: unknown, path: string, fallback: unknown = null): string {
+function readPath(
+  obj: unknown,
+  path: string,
+  fallback: unknown = null,
+): string {
   if (!obj || typeof obj !== 'object') return String(fallback ?? '');
   const parts = path.split('.');
   let cursor: unknown = obj;
@@ -32,20 +40,7 @@ function readPath(obj: unknown, path: string, fallback: unknown = null): string 
 }
 
 function normalizeOrderStatus(value: unknown): string {
-  const normalized = (value ?? '').toString().trim().toLowerCase();
-  switch (normalized) {
-    case 'openforbids':
-    case 'bidding':
-    case 'pendingbids':
-      return 'bidding';
-    case 'pending':
-    case 'created':
-    case 'draft':
-    case 'scheduled':
-      return normalized;
-    default:
-      return normalized;
-  }
+  return (value ?? '').toString().trim().toLowerCase();
 }
 
 function normalizeBidStatus(value: unknown): string {
@@ -67,7 +62,9 @@ export class OrdersService {
     if (!this.stripe) {
       const secret = this.config.get<string>('stripe.secretKey');
       if (!secret) {
-        throw new BadRequestException('Stripe is not configured on the API server');
+        throw new BadRequestException(
+          'Stripe is not configured on the API server',
+        );
       }
       this.stripe = new Stripe(secret);
     }
@@ -98,6 +95,13 @@ export class OrdersService {
     }
 
     const merchantData = merchantSnap.data() ?? {};
+    if (
+      (merchantData.status ?? '').toString().trim().toLowerCase() !== 'approved'
+    ) {
+      throw new ForbiddenException(
+        'Merchant account must be approved before creating orders',
+      );
+    }
     const shop = (merchantData.shop as Record<string, unknown>) ?? {};
     const location = (merchantData.location as Record<string, unknown>) ?? {};
     const merchantLat = Number(location.latitude ?? 0) || undefined;
@@ -135,7 +139,9 @@ export class OrdersService {
     const now = this.firebase.serverTimestamp();
     const scheduledAt = dto.scheduledAt ? new Date(dto.scheduledAt) : null;
     if (scheduledAt && Number.isNaN(scheduledAt.getTime())) {
-      throw new BadRequestException('scheduledAt must be a valid ISO-8601 date');
+      throw new BadRequestException(
+        'scheduledAt must be a valid ISO-8601 date',
+      );
     }
 
     const orderDoc = {
@@ -167,7 +173,9 @@ export class OrdersService {
           ...(dto.pickup.street ? { street: dto.pickup.street } : {}),
           city: dto.pickup.city,
           ...(dto.pickup.state ? { state: dto.pickup.state } : {}),
-          ...(dto.pickup.postalCode ? { postalCode: dto.pickup.postalCode } : {}),
+          ...(dto.pickup.postalCode
+            ? { postalCode: dto.pickup.postalCode }
+            : {}),
           ...(dto.pickup.country ? { country: dto.pickup.country } : {}),
           countryCode: dto.pickup.countryCode,
           ...(dto.pickup.placeId ? { placeId: dto.pickup.placeId } : {}),
@@ -212,7 +220,7 @@ export class OrdersService {
       },
       route: preview.route,
       assignment: { driverId: null, companyId: null },
-      security: { dropoffPin },
+      security: { requiresPin: true },
       ratings: { customerToDriver: {}, driverToCustomer: {} },
       timeline: {
         merchantPlacedAt: now,
@@ -257,12 +265,29 @@ export class OrdersService {
       serviceArea: serviceAreaInfo,
     };
 
-    await orderRef.set(orderDoc);
-    await orderRef.collection(COLLECTIONS.events).doc('order_created').set({
-      type: 'order_created',
-      actor: { type: 'merchant_api', merchantId: merchant.merchantId },
+    const secretRef = this.firebase.db
+      .collection(COLLECTIONS.orderSecrets)
+      .doc(orderRef.id);
+    const writeBatch = this.firebase.db.batch();
+    writeBatch.set(orderRef, orderDoc);
+    writeBatch.set(secretRef, {
+      orderId: orderRef.id,
+      customerId: '',
+      merchantId: merchant.merchantId,
+      dropoffPin,
+      createdByUid: merchant.ownerUid,
       createdAt: now,
+      verifiedAt: null,
     });
+    await writeBatch.commit();
+    await orderRef
+      .collection(COLLECTIONS.events)
+      .doc('order_created')
+      .set({
+        type: 'order_created',
+        actor: { type: 'merchant_api', merchantId: merchant.merchantId },
+        createdAt: now,
+      });
 
     await merchantSnap.ref.set(
       {
@@ -285,7 +310,7 @@ export class OrdersService {
 
     return {
       orderId: orderRef.id,
-      status: 'pending',
+      status: orderDoc.status,
       trackingToken: orderRef.id,
       trackingUrl,
       pricing: {
@@ -298,7 +323,10 @@ export class OrdersService {
   }
 
   async getOrder(merchant: MerchantContext, orderId: string) {
-    const order = await this.getMerchantOrderOrThrow(merchant.merchantId, orderId);
+    const order = await this.getMerchantOrderOrThrow(
+      merchant.merchantId,
+      orderId,
+    );
     return this.serializeOrder(order.id, order.data);
   }
 
@@ -320,7 +348,9 @@ export class OrdersService {
     bidId: string,
     returnUrl: string,
   ) {
-    const orderRef = this.firebase.db.collection(COLLECTIONS.orders).doc(orderId);
+    const orderRef = this.firebase.db
+      .collection(COLLECTIONS.orders)
+      .doc(orderId);
     const orderSnap = await orderRef.get();
     if (!orderSnap.exists) {
       throw new NotFoundException('Order not found');
@@ -337,7 +367,10 @@ export class OrdersService {
       throw new ConflictException('Order is no longer open for bids');
     }
 
-    const bidSnap = await orderRef.collection(COLLECTIONS.bids).doc(bidId).get();
+    const bidSnap = await orderRef
+      .collection(COLLECTIONS.bids)
+      .doc(bidId)
+      .get();
     if (!bidSnap.exists) {
       throw new NotFoundException('Bid not found');
     }
@@ -353,16 +386,22 @@ export class OrdersService {
       .doc(driverId)
       .get();
     const driverData = driverSnap.data() ?? {};
-    const companyId = readPath(bidData, 'company.id', driverData.companyId ?? '');
+    const companyId = readPath(
+      bidData,
+      'company.id',
+      driverData.companyId ?? '',
+    );
 
     let destinationAccountId = '';
+    let companyData: Record<string, unknown> = {};
     if (companyId) {
       const companySnap = await this.firebase.db
         .collection(COLLECTIONS.companyProfiles)
         .doc(companyId)
         .get();
+      companyData = companySnap.data() ?? {};
       destinationAccountId = readPath(
-        companySnap.data(),
+        companyData,
         'stripe.connectAccountId',
         '',
       );
@@ -384,16 +423,20 @@ export class OrdersService {
 
     const fixedFeeNok = this.config.get<number>('platform.fixedFeeNok', 29);
     const percentFee = this.config.get<number>('platform.percentFee', 0.1);
-    const fixedFeeOre = fixedFeeNok * 100;
-    const percentFeeOre = Math.round(amountOre * percentFee);
-    const platformFeeOre = Math.min(amountOre, fixedFeeOre + percentFeeOre);
+    const split = calculateDeliveryDistribution({
+      totalOre: amountOre,
+      platformFixedFeeOre: fixedFeeNok * 100,
+      platformPercent: percentFee,
+      companyCommissionPercent: companyId
+        ? companyCommissionPercent(companyData)
+        : 0,
+    });
 
     const separator = returnUrl.includes('?') ? '&' : '?';
     const successUrl =
       `${returnUrl}${separator}payment=success&session_id={CHECKOUT_SESSION_ID}` +
       `&orderId=${encodeURIComponent(orderId)}&bidId=${encodeURIComponent(bidId)}`;
-    const cancelUrl =
-      `${returnUrl}${separator}payment=cancelled&orderId=${encodeURIComponent(orderId)}`;
+    const cancelUrl = `${returnUrl}${separator}payment=cancelled&orderId=${encodeURIComponent(orderId)}`;
 
     const stripe = this.getStripe();
     const session = await stripe.checkout.sessions.create({
@@ -414,7 +457,7 @@ export class OrdersService {
         },
       ],
       payment_intent_data: {
-        application_fee_amount: platformFeeOre,
+        application_fee_amount: split.platformFeeOre,
         transfer_data: { destination: destinationAccountId },
         metadata: {
           orderId,
@@ -422,6 +465,11 @@ export class OrdersService {
           driverId,
           merchantId: merchant.merchantId,
           companyId,
+          platformFeeOre: String(split.platformFeeOre),
+          distributableOre: String(split.distributableOre),
+          companyCommissionPercent: String(split.companyCommissionPercent),
+          companyEarningOre: String(split.companyEarningOre),
+          driverEarningOre: String(split.driverEarningOre),
         },
       },
       metadata: {
@@ -430,6 +478,7 @@ export class OrdersService {
         driverId,
         merchantId: merchant.merchantId,
         companyId,
+        companyCommissionPercent: String(split.companyCommissionPercent),
       },
     });
 
@@ -441,6 +490,21 @@ export class OrdersService {
           checkoutSessionId: session.id,
           checkoutBidId: bidId,
           status: 'checkout_pending',
+          totalOre: split.totalOre,
+          platformFeeOre: split.platformFeeOre,
+          destinationNetOre: split.distributableOre,
+          companyCommissionPercent: split.companyCommissionPercent,
+          companyEarningOre: split.companyEarningOre,
+          driverEarningOre: split.driverEarningOre,
+        },
+        pricing: {
+          amount: amountNok,
+          total: amountNok,
+          platformFee: split.platformFeeOre / 100,
+          companyNet: split.distributableOre / 100,
+          companyCommissionPercent: split.companyCommissionPercent,
+          companyEarning: split.companyEarningOre / 100,
+          driverEarning: split.driverEarningOre / 100,
         },
         updatedAt: this.firebase.serverTimestamp(),
       },
@@ -455,6 +519,39 @@ export class OrdersService {
     };
   }
 
+  async rejectBid(merchant: MerchantContext, orderId: string, bidId: string) {
+    const orderRef = this.firebase.db.collection(COLLECTIONS.orders).doc(orderId);
+    const bidRef = orderRef.collection(COLLECTIONS.bids).doc(bidId);
+    await this.firebase.db.runTransaction(async (tx) => {
+      const orderSnap = await tx.get(orderRef);
+      if (!orderSnap.exists) throw new NotFoundException('Order not found');
+      const order = orderSnap.data() ?? {};
+      if (readPath(order, 'source.merchantId', '') !== merchant.merchantId) {
+        throw new ForbiddenException('Order does not belong to this merchant');
+      }
+      if (!OPEN_ORDER_STATUSES.has(normalizeOrderStatus(order.status))) {
+        throw new ConflictException('Order is no longer open for bids');
+      }
+      if (readPath(order, 'payment.checkoutBidId', '') === bidId &&
+          ['checkout_pending', 'paid'].includes(readPath(order, 'payment.status', ''))) {
+        throw new ConflictException('This bid has an active checkout; resolve payment before rejecting it');
+      }
+      const bidSnap = await tx.get(bidRef);
+      if (!bidSnap.exists) throw new NotFoundException('Bid not found');
+      const bid = bidSnap.data() ?? {};
+      if (normalizeBidStatus(bid.status) === 'rejected') return;
+      if (!ACTIVE_BID_STATUSES.has(normalizeBidStatus(bid.status))) {
+        throw new ConflictException('Bid is no longer active');
+      }
+      const now = this.firebase.serverTimestamp();
+      tx.set(bidRef, { status: 'rejected', rejectedAt: now, updatedAt: now,
+        rejectedByMerchantId: merchant.merchantId }, { merge: true });
+      tx.set(orderRef.collection('events').doc(), { type: 'bid_rejected', orderId, bidId,
+        actorRole: 'merchant', actorId: merchant.merchantId, createdAt: now });
+    });
+    return { orderId, bidId, status: 'rejected' };
+  }
+
   async finalizeBid(
     merchant: MerchantContext,
     orderId: string,
@@ -466,8 +563,14 @@ export class OrdersService {
     if (session.payment_status !== 'paid') {
       throw new ConflictException('Checkout payment is not completed yet');
     }
+    if (session.metadata?.merchantId !== merchant.merchantId ||
+        session.metadata?.orderId !== orderId || session.metadata?.bidId !== bidId) {
+      throw new ForbiddenException('Checkout session does not belong to this order and bid');
+    }
 
-    const orderRef = this.firebase.db.collection(COLLECTIONS.orders).doc(orderId);
+    const orderRef = this.firebase.db
+      .collection(COLLECTIONS.orders)
+      .doc(orderId);
     const bidRef = orderRef.collection(COLLECTIONS.bids).doc(bidId);
 
     await this.firebase.db.runTransaction(async (tx) => {
@@ -481,25 +584,10 @@ export class OrdersService {
       if (orderMerchantId !== merchant.merchantId) {
         throw new ForbiddenException('Order does not belong to this merchant');
       }
-
-      const paymentStatus = normalizeBidStatus(
-        orderData.paymentStatus ?? readPath(orderData, 'payment.status', ''),
-      );
-      if (paymentStatus !== 'paid') {
-        await tx.set(
-          orderRef,
-          {
-            paymentStatus: 'paid',
-            payment: {
-              ...(orderData.payment as object),
-              status: 'paid',
-              paidAt: this.firebase.serverTimestamp(),
-              checkoutSessionId: sessionId,
-            },
-            updatedAt: this.firebase.serverTimestamp(),
-          },
-          { merge: true },
-        );
+      if (readPath(orderData, 'payment.checkoutSessionId', '') !== sessionId ||
+          readPath(orderData, 'payment.checkoutBidId', '') !== bidId ||
+          session.currency !== 'nok' || session.amount_total !== Number(readPath(orderData, 'payment.totalOre', '0'))) {
+        throw new ConflictException('Checkout session does not match the saved payment');
       }
 
       const currentStatus = normalizeOrderStatus(orderData.status);
@@ -531,6 +619,8 @@ export class OrdersService {
         orderRef,
         {
           status: 'bid_accepted',
+          paymentStatus: 'paid',
+          payment: { ...(orderData.payment as object), status: 'paid', paidAt: now, checkoutSessionId: sessionId },
           assignment: {
             acceptedBidId: bidId,
             driverId,
@@ -625,7 +715,8 @@ export class OrdersService {
       createdAt: data.createdAt,
       updatedAt: data.updatedAt,
       scheduledAt: data.scheduledAt ?? null,
-      creatorType: data.creatorType ?? readPath(data, 'source.type', 'merchant'),
+      creatorType:
+        data.creatorType ?? readPath(data, 'source.type', 'merchant'),
       merchantId,
       source: data.source ?? null,
       tracking: {
@@ -665,7 +756,8 @@ export class OrdersService {
       },
       timeline,
       payment: data.payment ?? { status: data.paymentStatus ?? null },
-      paymentStatus: data.paymentStatus ?? readPath(data, 'payment.status', null),
+      paymentStatus:
+        data.paymentStatus ?? readPath(data, 'payment.status', null),
     };
   }
 

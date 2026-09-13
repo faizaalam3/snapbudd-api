@@ -64,6 +64,16 @@ export class OrdersController {
     );
   }
 
+  @Post(':orderId/bids/:bidId/reject')
+  @HttpCode(HttpStatus.OK)
+  rejectBid(
+    @CurrentMerchant() merchant: MerchantContext,
+    @Param('orderId') orderId: string,
+    @Param('bidId') bidId: string,
+  ) {
+    return this.ordersService.rejectBid(merchant, orderId, bidId);
+  }
+
   @Post(':orderId/bids/:bidId/finalize')
   @HttpCode(HttpStatus.OK)
   finalizeBid(

@@ -8,21 +8,11 @@ export const COLLECTIONS = {
   companyProfiles: 'companyprofiles',
   platformConfig: 'platformConfig',
   serviceAreasDoc: 'serviceAreas',
+  orderSecrets: 'orderSecrets',
 } as const;
 
-export const OPEN_ORDER_STATUSES = new Set([
-  'draft',
-  'created',
-  'pending',
-  'bidding',
-  'scheduled',
-  'openforbids',
-]);
+export const OPEN_ORDER_STATUSES = new Set(['bidding', 'scheduled']);
 
-export const ACTIVE_BID_STATUSES = new Set([
-  'active',
-  'pending',
-  'open',
-]);
+export const ACTIVE_BID_STATUSES = new Set(['active', 'pending', 'open']);
 
 export const APPROVED_MERCHANT_STATUS = 'approved';

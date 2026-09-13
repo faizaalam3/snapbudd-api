@@ -14,7 +14,23 @@ This guide is for developers integrating SnapBudd delivery into a shop website.
 | Environment | URL |
 |-------------|-----|
 | Local | `http://localhost:3000` |
-| Production | Set by your deployment (e.g. `https://api.snapbudd.io`) |
+| Production | `https://snapbudd-api.onrender.com` |
+
+Verify the hosted API before integrating:
+
+```bash
+curl https://snapbudd-api.onrender.com/health
+```
+
+Expected response:
+
+```json
+{
+  "status": "ok",
+  "service": "snapbudd-api",
+  "version": "1.0.0"
+}
+```
 
 ## Authentication headers
 
@@ -37,8 +53,8 @@ sequenceDiagram
   participant Stripe as Stripe Checkout
 
   Shop->>API: POST /v1/orders
-  API->>FS: Create order (status: pending)
-  API-->>Shop: orderId, trackingUrl
+  API->>FS: Create order (status: bidding or scheduled)
+  API-->>Shop: orderId, trackingUrl (bidding or scheduled)
 
   Driver->>FS: Place bids
   Shop->>API: GET /v1/orders/{id}/bids
@@ -60,6 +76,14 @@ sequenceDiagram
 ```
 
 ## 1. Create order
+
+### Rejecting a bid
+
+Send `POST /v1/orders/{orderId}/bids/{bidId}/reject` with merchant headers and no body. Response: `{ "orderId": "...", "bidId": "...", "status": "rejected" }`. Repeated rejection is idempotent. Other merchants' orders, closed orders and bids with active payment checkout are denied. This route requires the updated API deployment.
+
+### Verified finalization
+
+Finalization verifies Stripe session metadata (merchant/order/bid), saved checkout ID, bid ID, currency and payment amount. A return URL alone is not payment proof. Authenticate the shop user and compare the returned session with the one saved on your backend. Never blindly retry create or checkout writes: the API has no idempotency-key contract. REST tracking URLs currently use the legacy tracking contract, not the portal's expiring share-link contract; verify its privacy-filtered public handler before sharing.
 
 **`POST /v1/orders`**
 
@@ -102,7 +126,7 @@ sequenceDiagram
 ### Example request
 
 ```bash
-curl -X POST https://api.snapbudd.io/v1/orders \
+curl -X POST https://snapbudd-api.onrender.com/v1/orders \
   -H "X-Merchant-Id: YOUR_MERCHANT_ID" \
   -H "X-Api-Key: sb_live_YOUR_KEY" \
   -H "Content-Type: application/json" \

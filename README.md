@@ -4,6 +4,29 @@ REST API for external shop websites to create delivery orders, list driver bids,
 
 Built with **NestJS 11** and **Firebase Admin SDK**, writing to the same Firestore collections used by the SnapBudd mobile app and merchant portal (`snapbudd-1`).
 
+## Live API
+
+| Environment | Base URL |
+|-------------|----------|
+| Production (Render) | `https://snapbudd-api.onrender.com` |
+| Local development | `http://localhost:3000` |
+
+Health check:
+
+```bash
+curl https://snapbudd-api.onrender.com/health
+```
+
+Expected response:
+
+```json
+{
+  "status": "ok",
+  "service": "snapbudd-api",
+  "version": "1.0.0"
+}
+```
+
 ## Quick start (local)
 
 1. Copy environment file:
@@ -53,11 +76,14 @@ Authorization: Bearer <firebase_id_token>
 | `GET` | `/v1/orders/:orderId` | Track order |
 | `GET` | `/v1/orders/:orderId/bids` | List bids |
 | `POST` | `/v1/orders/:orderId/bids/:bidId/checkout` | Start Stripe checkout |
+| `POST` | `/v1/orders/:orderId/bids/:bidId/reject` | Reject an active bid on an owned open order |
 | `POST` | `/v1/orders/:orderId/bids/:bidId/finalize` | Finalize after payment |
 | `GET` | `/v1/portal/credentials` | Portal: view API credentials metadata |
 | `POST` | `/v1/portal/api-key/generate` | Portal: generate API key |
 
 See [docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) for request/response schemas and integration flow.
+
+Use [docs/WEBSITE_DEVELOPER_HANDOFF.md](docs/WEBSITE_DEVELOPER_HANDOFF.md) when sending setup instructions to external website developers.
 
 ## Deployment
 
