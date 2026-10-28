@@ -10,9 +10,8 @@ const transitions: Record<ProfileStatus, ReadonlySet<ProfileStatus>> = {
 };
 
 export function normalizeProfileStatus(value: unknown): ProfileStatus {
-  const status = String(value ?? 'draft')
-    .trim()
-    .toLowerCase();
+  const status =
+    typeof value === 'string' ? value.trim().toLowerCase() : 'draft';
   return status in transitions ? (status as ProfileStatus) : 'draft';
 }
 

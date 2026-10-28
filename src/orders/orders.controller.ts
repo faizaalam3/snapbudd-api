@@ -12,11 +12,7 @@ import { MerchantApiKeyGuard } from '../common/guards/merchant-api-key.guard';
 import { CurrentMerchant } from '../common/decorators/current-merchant.decorator';
 import type { MerchantContext } from '../common/types/merchant-context';
 import { OrdersService } from './orders.service';
-import {
-  AcceptBidDto,
-  CreateOrderDto,
-  FinalizeBidDto,
-} from './dto/orders.dto';
+import { AcceptBidDto, CreateOrderDto, FinalizeBidDto } from './dto/orders.dto';
 
 @Controller('v1/orders')
 @UseGuards(MerchantApiKeyGuard)
@@ -30,6 +26,11 @@ export class OrdersController {
     @Body() dto: CreateOrderDto,
   ) {
     return this.ordersService.createOrder(merchant, dto);
+  }
+
+  @Get('outlets')
+  listOutlets(@CurrentMerchant() merchant: MerchantContext) {
+    return this.ordersService.listOutlets(merchant);
   }
 
   @Get(':orderId')

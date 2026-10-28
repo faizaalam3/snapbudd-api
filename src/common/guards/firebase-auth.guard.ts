@@ -69,12 +69,15 @@ export class FirebaseAuthGuard implements CanActivate {
     }
 
     const data = membership.data();
-    const merchantId = (data?.merchantId ?? '').toString().trim();
+    const merchantId =
+      typeof data?.merchantId === 'string' ? data.merchantId.trim() : '';
     if (!merchantId) {
       throw new ForbiddenException('No merchant workspace linked to this user');
     }
     if (
-      (data?.status ?? 'active').toString().trim().toLowerCase() !== 'active'
+      (typeof data?.status === 'string'
+        ? data.status.trim().toLowerCase()
+        : 'active') !== 'active'
     ) {
       throw new ForbiddenException('Merchant workspace access is inactive');
     }
@@ -87,10 +90,11 @@ export class FirebaseAuthGuard implements CanActivate {
   }
 
   private safeErrorCode(error: unknown): string {
-    const code =
+    const rawCode =
       error && typeof error === 'object' && 'code' in error
-        ? String(error.code)
+        ? (error as { code?: unknown }).code
         : '';
+    const code = typeof rawCode === 'string' ? rawCode : '';
     return /^[a-zA-Z0-9_/-]{1,80}$/.test(code) ? code : 'unknown';
   }
 }

@@ -1,17 +1,21 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { FirebaseService } from '../firebase/firebase.service';
+import {
+  calculateDelivery,
+  loadPolicy,
+  DEFAULT_POLICY,
+  type PricingPolicy,
+} from './pricing-policy.cjs';
 
 @Injectable()
 export class PricingService {
-  private readonly serviceFee: number;
-  private readonly vanMultiplier = 1.5;
-  private readonly band1 = 19;
-  private readonly band2 = 39;
-  private readonly band3 = 80;
   private readonly mapsApiKey: string;
 
-  constructor(private readonly config: ConfigService) {
-    this.serviceFee = this.config.get<number>('platform.fixedFeeNok', 29);
+  constructor(
+    private readonly config: ConfigService,
+    private readonly firebase: FirebaseService,
+  ) {
     this.mapsApiKey = this.config.get<string>('googleMapsApiKey', '') ?? '';
   }
 
@@ -86,48 +90,30 @@ export class PricingService {
     return r * c;
   }
 
-  calculatePricing(input: {
-    distanceKm: number;
-    packageSize: string;
-    vehicleType: string;
-    discountAmount?: number;
-  }) {
-    const dist = input.distanceKm < 0 ? 0 : input.distanceKm;
-    const size = input.packageSize.trim() || 'Medium';
-    const vehicleType = input.vehicleType.trim() || 'Car';
+  async activePolicy(): Promise<PricingPolicy> {
+    return loadPolicy(this.firebase.db);
+  }
 
-    let base: number;
-    if (dist <= this.band1) {
-      base = this.bySize(size, 129, 349, 599);
-    } else if (dist <= this.band2) {
-      base = this.bySize(size, 195, 449, 899);
-    } else if (dist <= this.band3) {
-      base = this.bySize(size, 299, 599, 1299);
-    } else {
-      const extraKm = dist - this.band3;
-      const start = this.bySize(size, 299, 599, 1299);
-      const perKm = this.bySize(size, 3.5, 5.0, 8.0);
-      base = start + extraKm * perKm;
+  calculatePricing(
+    input: {
+      distanceKm: number;
+      packageSize: string;
+      vehicleType: string;
+      discountAmount?: number;
+    },
+    policy: PricingPolicy = DEFAULT_POLICY,
+  ) {
+    try {
+      const vehicleType =
+        { car: 'Car', van: 'Van', bike: 'Bike' }[
+          input.vehicleType.trim().toLowerCase()
+        ] || input.vehicleType;
+      return calculateDelivery({ ...input, vehicleType }, policy);
+    } catch {
+      throw new BadRequestException(
+        'Select a supported package, vehicle and valid driving distance.',
+      );
     }
-
-    const multiplier =
-      vehicleType.toLowerCase() === 'van' ? this.vanMultiplier : 1;
-    const subtotal = base * multiplier + this.serviceFee;
-    const discount =
-      input.discountAmount && input.discountAmount > 0
-        ? input.discountAmount
-        : 0;
-    const total = Math.max(0, subtotal - discount);
-
-    return {
-      currency: 'NOK',
-      base: this.round2(base),
-      serviceFee: this.round2(this.serviceFee),
-      vehicleMultiplier: this.round2(multiplier),
-      subtotal: this.round2(subtotal),
-      discount: this.round2(discount),
-      total: this.round2(total),
-    };
   }
 
   async previewRoute(input: {
@@ -161,21 +147,63 @@ export class PricingService {
         ? { lat: input.dropoffLat, lng: input.dropoffLng }
         : await this.resolveCoordinates(input.dropoffAddress);
 
-    const distanceKm = this.haversineKm(
-      pickupGeo.lat,
-      pickupGeo.lng,
-      dropoffGeo.lat,
-      dropoffGeo.lng,
-    );
-    const durationMin =
-      distanceKm > 0 ? Math.max(8, Math.round(distanceKm / 0.55)) : 0;
-
-    const pricing = this.calculatePricing({
-      distanceKm,
-      packageSize: input.packageSize,
-      vehicleType: input.vehicleType,
-      discountAmount: input.discountAmount,
+    if (
+      !this.mapsApiKey ||
+      !Number.isFinite(pickupGeo.lat) ||
+      !Number.isFinite(pickupGeo.lng) ||
+      !Number.isFinite(dropoffGeo.lat) ||
+      !Number.isFinite(dropoffGeo.lng) ||
+      (pickupGeo.lat === 0 && pickupGeo.lng === 0) ||
+      (dropoffGeo.lat === 0 && dropoffGeo.lng === 0)
+    )
+      throw new BadRequestException(
+        'Locate both addresses and configure delivery routing before creating an order.',
+      );
+    const params = new URLSearchParams({
+      origin: `${pickupGeo.lat},${pickupGeo.lng}`,
+      destination: `${dropoffGeo.lat},${dropoffGeo.lng}`,
+      mode: 'driving',
+      key: this.mapsApiKey,
     });
+    let distanceKm: number, durationMin: number;
+    try {
+      const response = await fetch(
+        `https://maps.googleapis.com/maps/api/directions/json?${params}`,
+        { signal: AbortSignal.timeout(10000) },
+      );
+      const result = (await response.json()) as {
+        status?: string;
+        routes?: Array<{
+          legs?: Array<{
+            distance?: { value?: number };
+            duration?: { value?: number };
+          }>;
+        }>;
+      };
+      const legs = result.routes?.[0]?.legs;
+      if (!response.ok || result.status !== 'OK' || !legs?.length)
+        throw new Error('No driving route');
+      distanceKm =
+        legs.reduce((sum, leg) => sum + Number(leg.distance?.value), 0) / 1000;
+      durationMin =
+        legs.reduce((sum, leg) => sum + Number(leg.duration?.value), 0) / 60;
+      if (!Number.isFinite(durationMin) || durationMin < 0)
+        throw new Error('Invalid duration');
+    } catch {
+      throw new BadRequestException(
+        'Cannot estimate the driving route. Check the addresses and retry.',
+      );
+    }
+
+    const pricing = this.calculatePricing(
+      {
+        distanceKm,
+        packageSize: input.packageSize,
+        vehicleType: input.vehicleType,
+        discountAmount: input.discountAmount,
+      },
+      await this.activePolicy(),
+    );
 
     return {
       pickup: pickupGeo,
@@ -186,18 +214,6 @@ export class PricingService {
       },
       pricing,
     };
-  }
-
-  private bySize(size: string, small: number, medium: number, large: number) {
-    switch (size) {
-      case 'Medium':
-        return medium;
-      case 'Large':
-        return large;
-      case 'Small':
-      default:
-        return small;
-    }
   }
 
   private round2(value: number): number {

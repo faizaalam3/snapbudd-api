@@ -1,5 +1,8 @@
 import {
   IsBoolean,
+  Equals,
+  IsDefined,
+  IsISO8601,
   IsEnum,
   IsNotEmpty,
   IsNumber,
@@ -7,9 +10,12 @@ import {
   IsString,
   IsUrl,
   MaxLength,
+  Max,
+  Matches,
   Min,
   MinLength,
   ValidateNested,
+  ValidateIf,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 
@@ -77,6 +83,7 @@ class AddressDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(2)
+  @Matches(/^[A-Z]{2}$/)
   countryCode!: string;
 
   @IsOptional()
@@ -87,27 +94,53 @@ class AddressDto {
   @IsOptional()
   @IsNumber()
   @Min(-90)
+  @Max(90)
   lat?: number;
 
   @IsOptional()
   @IsNumber()
   @Min(-180)
+  @Max(180)
   lng?: number;
 }
 
 export class CreateOrderDto {
+  @IsOptional()
+  @IsString()
+  @Matches(/^[a-zA-Z0-9_-]{1,128}$/)
+  outletId?: string;
+
+  @IsDefined()
+  @IsBoolean()
+  @Equals(true, {
+    message:
+      'Explicit authorization for assigned-driver store pickup is required',
+  })
+  pickupAuthorizationGranted!: boolean;
+
+  @ValidateIf(
+    (input: CreateOrderDto) => !input.outletId || input.pickup !== undefined,
+  )
+  @IsDefined()
   @ValidateNested()
   @Type(() => AddressDto)
   pickup!: AddressDto;
 
+  @IsDefined()
   @ValidateNested()
   @Type(() => AddressDto)
   dropoff!: AddressDto;
 
+  @ValidateIf(
+    (input: CreateOrderDto) =>
+      !input.outletId || input.pickupContact !== undefined,
+  )
+  @IsDefined()
   @ValidateNested()
   @Type(() => ContactDto)
   pickupContact!: ContactDto;
 
+  @IsDefined()
   @ValidateNested()
   @Type(() => ContactDto)
   dropoffContact!: ContactDto;
@@ -166,7 +199,7 @@ export class CreateOrderDto {
   amount?: number;
 
   @IsOptional()
-  @IsString()
+  @IsISO8601({ strict: true })
   scheduledAt?: string;
 }
 

@@ -1,9 +1,5 @@
 import { readFileSync } from 'fs';
-import {
-  cert,
-  applicationDefault,
-  ServiceAccount,
-} from 'firebase-admin/app';
+import { cert, applicationDefault, ServiceAccount } from 'firebase-admin/app';
 
 export function resolveFirebaseCredential() {
   const jsonFromEnv = process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim();

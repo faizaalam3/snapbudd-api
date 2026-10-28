@@ -73,6 +73,7 @@ Authorization: Bearer <firebase_id_token>
 |--------|------|-------------|
 | `GET` | `/health` | Service health |
 | `POST` | `/v1/orders` | Create order |
+| `GET` | `/v1/orders/outlets` | List your saved outlets (merchant API authentication) |
 | `GET` | `/v1/orders/:orderId` | Track order |
 | `GET` | `/v1/orders/:orderId/bids` | List bids |
 | `POST` | `/v1/orders/:orderId/bids/:bidId/checkout` | Start Stripe checkout |
@@ -82,6 +83,27 @@ Authorization: Bearer <firebase_id_token>
 | `POST` | `/v1/portal/api-key/generate` | Portal: generate API key |
 
 See [docs/DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) for request/response schemas and integration flow.
+
+### Outlet pickup
+
+Create and edit outlets in the shared portal's **Outlets** page. Deactivate an
+outlet to stop new pickups without deleting its historical order attribution.
+`GET /v1/orders/outlets` returns saved outlet IDs, names, addresses, coordinates,
+contacts and `active` flags. Filter for `active: true` when offering pickup choices.
+
+Pass `outletId` to `POST /v1/orders` instead of `pickup` and `pickupContact`.
+The API loads the outlet from your own merchant profile and uses its saved pickup
+location and contact. You may provide `pickupContact` to override the contact for
+this order; supplied pickup coordinates never override the selected outlet.
+Without `outletId`, the existing manual-address contract is unchanged.
+
+Orders retain `source.outletId` and `source.outletName` so editing or deactivating
+an outlet does not alter existing pickups. Reporting separates completed delivery
+spend from declared merchandise value; neither represents merchant sales revenue.
+
+Deploy the updated Cloud Functions address lookup, Firestore rules, API and
+shared portal together before using outlets. No existing merchant data migration
+is required; previous orders appear as manual / legacy pickup orders.
 
 Use [docs/WEBSITE_DEVELOPER_HANDOFF.md](docs/WEBSITE_DEVELOPER_HANDOFF.md) when sending setup instructions to external website developers.
 

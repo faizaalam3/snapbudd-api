@@ -19,12 +19,15 @@ export function companyCommissionPercent(
   company: Record<string, unknown>,
 ): number {
   const policy = (company.driverPayoutPolicy ?? {}) as Record<string, unknown>;
-  return clampPercent(
+  const value = Number(
     policy.companyPercent ??
       company.driverCommissionPercent ??
-      company.commissionPercentage,
-    0,
+      company.commissionPercentage ??
+      10,
   );
+  if (!Number.isFinite(value) || value < 0 || value > 100)
+    throw new Error('Invalid company commission');
+  return value;
 }
 
 export function calculateDeliveryDistribution(input: {

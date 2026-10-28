@@ -122,15 +122,19 @@ export class ServiceAreaService {
       for (const item of rawCities) {
         if (!item || typeof item !== 'object') continue;
         const row = item as Record<string, unknown>;
-        const id = (row.id ?? '').toString().trim().toLowerCase();
-        const name = (row.name ?? '').toString().trim();
+        const id = this.configString(row.id).trim().toLowerCase();
+        const name = this.configString(row.name).trim();
         if (!id || !name) continue;
         cities.push({
           id,
           name,
-          countryCode: (row.countryCode ?? 'NO').toString().trim().toUpperCase(),
+          countryCode: this.configString(row.countryCode, 'NO')
+            .trim()
+            .toUpperCase(),
           aliases: Array.isArray(row.aliases)
-            ? row.aliases.map((a) => a.toString().trim()).filter(Boolean)
+            ? row.aliases
+                .map((alias) => this.configString(alias).trim())
+                .filter((alias) => alias.length > 0)
             : [],
         });
       }
@@ -139,11 +143,14 @@ export class ServiceAreaService {
     return {
       ...DEFAULT_CONFIG,
       enabledCities: cities.length ? cities : DEFAULT_CONFIG.enabledCities,
-      defaultCountryCode: (data.defaultCountryCode ?? 'NO')
-        .toString()
+      defaultCountryCode: this.configString(data.defaultCountryCode, 'NO')
         .trim()
         .toUpperCase(),
     };
+  }
+
+  private configString(value: unknown, fallback = ''): string {
+    return typeof value === 'string' ? value : fallback;
   }
 
   private matchCity(
@@ -195,7 +202,10 @@ export class ServiceAreaService {
   private namesMatch(detected: string, candidate: string): boolean {
     if (!detected || !candidate) return false;
     if (detected === candidate) return true;
-    if (detected.startsWith(`${candidate} `) || candidate.startsWith(`${detected} `)) {
+    if (
+      detected.startsWith(`${candidate} `) ||
+      candidate.startsWith(`${detected} `)
+    ) {
       return true;
     }
     const shorter = detected.length <= candidate.length ? detected : candidate;

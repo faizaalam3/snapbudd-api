@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { FirebaseAuthGuard } from './firebase-auth.guard';
 import type { FirebaseService } from '../../firebase/firebase.service';
+/* eslint-disable @typescript-eslint/require-await */
 jest.mock('../../firebase/firebase.service', () => ({
   FirebaseService: class {},
 }));
@@ -18,11 +19,11 @@ function setup(
 ) {
   const request = { headers: { authorization: 'Bearer example-token' } };
   const get = jest.fn(async () => {
-    if (dbError) throw dbError;
+    if (dbError) throw toError(dbError);
     return { data: () => ({ merchantId, status }) };
   });
   const verifyIdToken = jest.fn(async () => {
-    if (authError) throw authError;
+    if (authError) throw toError(authError);
     return { uid: 'owner' };
   });
   const guard = new FirebaseAuthGuard({
@@ -33,6 +34,17 @@ function setup(
     switchToHttp: () => ({ getRequest: () => request }),
   } as unknown as ExecutionContext;
   return { guard, context, request, get };
+}
+
+function toError(value: unknown): Error {
+  if (value instanceof Error) return value;
+  const error = new Error('Test failure');
+  if (value && typeof value === 'object' && 'code' in value) {
+    (error as Error & { code?: unknown }).code = (
+      value as { code?: unknown }
+    ).code;
+  }
+  return error;
 }
 describe('Firebase portal authentication', () => {
   beforeAll(() => {

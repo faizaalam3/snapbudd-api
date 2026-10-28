@@ -8,8 +8,21 @@ import {
 import { createHash, timingSafeEqual } from 'crypto';
 import { Request } from 'express';
 import { FirebaseService } from '../../firebase/firebase.service';
-import { COLLECTIONS, APPROVED_MERCHANT_STATUS } from '../constants/firestore.constants';
+import {
+  COLLECTIONS,
+  APPROVED_MERCHANT_STATUS,
+} from '../constants/firestore.constants';
 import { MerchantContext } from '../types/merchant-context';
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function asString(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
 
 @Injectable()
 export class MerchantApiKeyGuard implements CanActivate {
@@ -35,17 +48,17 @@ export class MerchantApiKeyGuard implements CanActivate {
       throw new UnauthorizedException('Invalid merchant credentials');
     }
 
-    const merchant = merchantSnap.data() ?? {};
-    const status = (merchant.status ?? '').toString().toLowerCase();
+    const merchant = asRecord(merchantSnap.data());
+    const status = asString(merchant.status).toLowerCase();
     if (status !== APPROVED_MERCHANT_STATUS) {
       throw new ForbiddenException(
         'Merchant account must be approved before using the API',
       );
     }
 
-    const api = (merchant.api as Record<string, unknown> | undefined) ?? {};
-    const storedHash = (api.keyHash ?? '').toString();
-    const storedPrefix = (api.keyPrefix ?? '').toString();
+    const api = asRecord(merchant.api);
+    const storedHash = asString(api.keyHash);
+    const storedPrefix = asString(api.keyPrefix);
 
     if (!storedHash) {
       throw new ForbiddenException(
@@ -57,21 +70,18 @@ export class MerchantApiKeyGuard implements CanActivate {
       throw new UnauthorizedException('Invalid merchant credentials');
     }
 
-    const owner =
-      (merchant.owner as Record<string, unknown> | undefined) ?? {};
-    const shop = (merchant.shop as Record<string, unknown> | undefined) ?? {};
+    const owner = asRecord(merchant.owner);
+    const shop = asRecord(merchant.shop);
 
     const merchantContext: MerchantContext = {
       merchantId,
       status,
       displayName:
-        (shop.displayName ?? merchant.name ?? '').toString() || merchantId,
-      ownerUid: (
-        owner.uid ??
-        owner.ownerUid ??
-        merchant.ownerUid ??
-        ''
-      ).toString(),
+        asString(shop.displayName) || asString(merchant.name) || merchantId,
+      ownerUid:
+        asString(owner.uid) ||
+        asString(owner.ownerUid) ||
+        asString(merchant.ownerUid),
     };
 
     (request as Request & { merchant: MerchantContext }).merchant =
@@ -93,7 +103,7 @@ export class MerchantApiKeyGuard implements CanActivate {
   private readHeader(request: Request, name: string): string {
     const value = request.headers[name];
     if (Array.isArray(value)) return value[0]?.trim() ?? '';
-    return (value ?? '').toString().trim();
+    return typeof value === 'string' ? value.trim() : '';
   }
 
   private verifyApiKey(

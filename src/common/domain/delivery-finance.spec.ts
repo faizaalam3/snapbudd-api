@@ -38,9 +38,12 @@ describe('delivery finance', () => {
         driverPayoutPolicy: { companyPercent: 12.5 },
       }),
     ).toBe(12.5);
-    expect(companyCommissionPercent({ driverCommissionPercent: 140 })).toBe(
-      100,
-    );
-    expect(companyCommissionPercent({})).toBe(0);
+    expect(() =>
+      companyCommissionPercent({ driverCommissionPercent: 140 }),
+    ).toThrow('Invalid company commission');
+    expect(companyCommissionPercent({})).toBe(10);
+    expect(
+      companyCommissionPercent({ driverPayoutPolicy: { companyPercent: 0 } }),
+    ).toBe(0);
   });
 });

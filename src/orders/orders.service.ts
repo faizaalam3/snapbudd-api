@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import {
   BadRequestException,
   ConflictException,
@@ -22,29 +23,52 @@ import {
   companyCommissionPercent,
 } from '../common/domain/delivery-finance';
 
+function asRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function asString(value: unknown, fallback = ''): string {
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  return fallback;
+}
+
 function readPath(
   obj: unknown,
   path: string,
   fallback: unknown = null,
 ): string {
-  if (!obj || typeof obj !== 'object') return String(fallback ?? '');
+  if (!obj || typeof obj !== 'object') return asString(fallback);
   const parts = path.split('.');
   let cursor: unknown = obj;
   for (const part of parts) {
     if (!cursor || typeof cursor !== 'object' || !(part in cursor)) {
-      return String(fallback ?? '');
+      return asString(fallback);
     }
     cursor = (cursor as Record<string, unknown>)[part];
   }
-  return String(cursor ?? fallback ?? '');
+  return asString(cursor, asString(fallback));
 }
 
 function normalizeOrderStatus(value: unknown): string {
-  return (value ?? '').toString().trim().toLowerCase();
+  return asString(value).trim().toLowerCase();
+}
+
+/** Legacy bidding endpoints cannot mutate an upfront-funded delivery. */
+function requireLegacyBidFlow(order: unknown): void {
+  if (readPath(order, 'payment.flow', '') === 'fixed_upfront_v1') {
+    throw new ConflictException(
+      'This is a fixed-price delivery. Use upfront payment and driver job acceptance.',
+    );
+  }
 }
 
 function normalizeBidStatus(value: unknown): string {
-  return (value ?? 'pending').toString().trim().toLowerCase();
+  return asString(value, 'pending').trim().toLowerCase();
 }
 
 @Injectable()
@@ -71,7 +95,67 @@ export class OrdersService {
     return this.stripe;
   }
 
+  async listOutlets(merchant: MerchantContext) {
+    const saved = await this.firebase.db
+      .collection(COLLECTIONS.merchantProfiles)
+      .doc(merchant.merchantId)
+      .collection('outlets')
+      .get();
+    return saved.docs
+      .map((item) => ({ ...item.data(), id: item.id }))
+      .sort((a, b) => String(a['name']).localeCompare(String(b['name'])));
+  }
+
   async createOrder(merchant: MerchantContext, dto: CreateOrderDto) {
+    let outlet: Record<string, unknown> | undefined;
+    let outletRef: FirebaseFirestore.DocumentReference | undefined;
+    if (dto.outletId) {
+      outletRef = this.firebase.db
+        .collection(COLLECTIONS.merchantProfiles)
+        .doc(merchant.merchantId)
+        .collection('outlets')
+        .doc(dto.outletId);
+      const saved = await outletRef.get();
+      if (!saved.exists || saved.data()?.active !== true) {
+        throw new BadRequestException('Selected outlet is unavailable');
+      }
+      outlet = saved.data()!;
+      const lat = Number(outlet.latitude);
+      const lng = Number(outlet.longitude);
+      if (
+        !Number.isFinite(lat) ||
+        Math.abs(lat) > 90 ||
+        !Number.isFinite(lng) ||
+        Math.abs(lng) > 180 ||
+        !outlet.address ||
+        !outlet.city ||
+        !outlet.countryCode
+      ) {
+        throw new BadRequestException(
+          'Outlet location is incomplete. Update it in the portal.',
+        );
+      }
+      // Resolve the pickup from the owned outlet, never from caller coordinates.
+      dto = {
+        ...dto,
+        pickup: {
+          formatted: asString(outlet.address),
+          city: asString(outlet.city),
+          countryCode: asString(outlet.countryCode),
+          postalCode: asString(outlet.postalCode),
+          lat,
+          lng,
+        },
+        pickupContact: dto.pickupContact || {
+          name: asString(outlet.contactName) || asString(outlet.name),
+          phone: asString(outlet.contactPhone),
+        },
+      };
+      if (!dto.pickupContact.phone.trim())
+        throw new BadRequestException(
+          'Outlet pickup phone is missing. Update it in the portal.',
+        );
+    }
     await this.serviceArea.ensureLoaded();
 
     const serviceAreaError = this.serviceArea.validateOrderStops({
@@ -94,16 +178,19 @@ export class OrdersService {
       throw new NotFoundException('Merchant profile not found');
     }
 
-    const merchantData = merchantSnap.data() ?? {};
-    if (
-      (merchantData.status ?? '').toString().trim().toLowerCase() !== 'approved'
-    ) {
+    const merchantData = asRecord(merchantSnap.data());
+    if (merchantData.restaurantMigration) {
+      throw new ForbiddenException(
+        'This business has moved to its restaurant workspace',
+      );
+    }
+    if (normalizeOrderStatus(merchantData.status) !== 'approved') {
       throw new ForbiddenException(
         'Merchant account must be approved before creating orders',
       );
     }
-    const shop = (merchantData.shop as Record<string, unknown>) ?? {};
-    const location = (merchantData.location as Record<string, unknown>) ?? {};
+    const shop = asRecord(merchantData.shop);
+    const location = asRecord(merchantData.location);
     const merchantLat = Number(location.latitude ?? 0) || undefined;
     const merchantLng = Number(location.longitude ?? 0) || undefined;
 
@@ -131,9 +218,16 @@ export class OrdersService {
 
     const customerName = dto.customer?.name?.trim() ?? '';
     const customerPhone = dto.customer?.phone?.trim() ?? '';
-    const negotiatedTotal =
-      dto.amount != null && dto.amount > 0 ? dto.amount : null;
-    const finalTotal = negotiatedTotal ?? preview.pricing.total;
+    // New requests use the canonical posted price; offers are legacy-only.
+    const finalTotal = preview.pricing.total;
+    const negotiatedTotal = null;
+    if (dto.amount != null && dto.amount !== finalTotal)
+      throw new BadRequestException(
+        'Delivery prices are fixed. Use the current quoted total.',
+      );
+    const policy = await this.pricing.activePolicy();
+    if (preview.pricing.pricingRevision !== policy.revision)
+      throw new ConflictException('Pricing changed. Request a new quote.');
     const dropoffPin = this.pricing.generateDropoffPin();
     const orderRef = this.firebase.db.collection(COLLECTIONS.orders).doc();
     const now = this.firebase.serverTimestamp();
@@ -145,8 +239,9 @@ export class OrdersService {
     }
 
     const orderDoc = {
-      schemaVersion: 2,
-      status: scheduledAt ? 'scheduled' : 'bidding',
+      id: orderRef.id,
+      schemaVersion: 3,
+      status: 'payment_pending',
       createdAt: now,
       updatedAt: now,
       scheduledAt: scheduledAt ?? null,
@@ -156,10 +251,12 @@ export class OrdersService {
       source: {
         type: 'merchant',
         merchantId: merchant.merchantId,
-        merchantName: (merchantData.name ?? '').toString(),
-        shopDisplayName: (shop.displayName ?? merchant.displayName).toString(),
+        merchantName: asString(merchantData.name),
+        shopDisplayName: asString(shop.displayName, merchant.displayName),
         createdByUid: merchant.ownerUid,
         channel: 'api',
+        outletId: dto.outletId || null,
+        outletName: outlet?.name || null,
       },
       customer: {
         id: '',
@@ -183,7 +280,7 @@ export class OrdersService {
         contact: {
           name: dto.pickupContact.name,
           phone: dto.pickupContact.phone,
-          company: (shop.displayName ?? merchant.displayName).toString(),
+          company: asString(shop.displayName, merchant.displayName),
         },
       },
       dropoff: {
@@ -221,6 +318,13 @@ export class OrdersService {
       route: preview.route,
       assignment: { driverId: null, companyId: null },
       security: { requiresPin: true },
+      pickupAuthorization: {
+        granted: dto.pickupAuthorizationGranted === true,
+        customerName: dto.customer?.name ?? dto.dropoffContact.name,
+        grantedByMerchantId: merchant.merchantId,
+        grantedAt: now,
+        consentVersion: 'pickup-v1',
+      },
       ratings: { customerToDriver: {}, driverToCustomer: {} },
       timeline: {
         merchantPlacedAt: now,
@@ -250,6 +354,13 @@ export class OrdersService {
       },
       payment: {
         provider: 'stripe',
+        flow: 'fixed_upfront_v1',
+        choice: 'upfront',
+        premium: false,
+        currency: 'NOK',
+        totalOre: Math.round(finalTotal * 100),
+        generation: 1,
+        fundedPolicy: policy,
         status: 'pending',
       },
       pricing: {
@@ -268,37 +379,66 @@ export class OrdersService {
     const secretRef = this.firebase.db
       .collection(COLLECTIONS.orderSecrets)
       .doc(orderRef.id);
-    const writeBatch = this.firebase.db.batch();
-    writeBatch.set(orderRef, orderDoc);
-    writeBatch.set(secretRef, {
-      orderId: orderRef.id,
-      customerId: '',
-      merchantId: merchant.merchantId,
-      dropoffPin,
-      createdByUid: merchant.ownerUid,
-      createdAt: now,
-      verifiedAt: null,
-    });
-    await writeBatch.commit();
-    await orderRef
-      .collection(COLLECTIONS.events)
-      .doc('order_created')
-      .set({
+    await this.firebase.db.runTransaction(async (tx) => {
+      const currentMerchant = await tx.get(merchantSnap.ref);
+      if (currentMerchant.data()?.status !== 'approved')
+        throw new ForbiddenException('Merchant account is no longer approved');
+      if (currentMerchant.data()?.restaurantMigration)
+        throw new ForbiddenException(
+          'This business has moved to its restaurant workspace',
+        );
+      if (outletRef && outlet) {
+        const current = (await tx.get(outletRef)).data();
+        if (!current || current.active !== true)
+          throw new ConflictException(
+            'Outlet became unavailable. Choose another pickup.',
+          );
+        if (
+          [
+            'name',
+            'address',
+            'city',
+            'countryCode',
+            'latitude',
+            'longitude',
+            'contactName',
+            'contactPhone',
+          ].some((key) => current[key] !== outlet[key])
+        ) {
+          throw new ConflictException(
+            'Outlet changed while preparing the order. Refresh its pickup details and try again.',
+          );
+        }
+      }
+      // Order, PIN, event and merchant count commit together. A failed auxiliary
+      // write must not leave a created order that the caller might retry.
+      tx.set(orderRef, orderDoc);
+      tx.set(secretRef, {
+        orderId: orderRef.id,
+        customerId: '',
+        merchantId: merchant.merchantId,
+        dropoffPin,
+        createdByUid: merchant.ownerUid,
+        createdAt: now,
+        verifiedAt: null,
+      });
+      tx.set(orderRef.collection(COLLECTIONS.events).doc('order_created'), {
         type: 'order_created',
         actor: { type: 'merchant_api', merchantId: merchant.merchantId },
         createdAt: now,
       });
-
-    await merchantSnap.ref.set(
-      {
-        stats: {
-          totalOrders: this.firebase.increment(1),
+      tx.set(
+        merchantSnap.ref,
+        {
+          stats: {
+            totalOrders: this.firebase.increment(1),
+            updatedAt: now,
+          },
           updatedAt: now,
         },
-        updatedAt: now,
-      },
-      { merge: true },
-    );
+        { merge: true },
+      );
+    });
 
     const trackingBaseUrl = this.config.get<string>('merchantTrackingBaseUrl');
     const trackingUrl = this.buildTrackingUrl(
@@ -331,7 +471,11 @@ export class OrdersService {
   }
 
   async listBids(merchant: MerchantContext, orderId: string) {
-    await this.getMerchantOrderOrThrow(merchant.merchantId, orderId);
+    const order = await this.getMerchantOrderOrThrow(
+      merchant.merchantId,
+      orderId,
+    );
+    requireLegacyBidFlow(order.data);
     const bidsSnap = await this.firebase.db
       .collection(COLLECTIONS.orders)
       .doc(orderId)
@@ -348,6 +492,44 @@ export class OrdersService {
     bidId: string,
     returnUrl: string,
   ) {
+    const order = (
+      await this.firebase.db.collection(COLLECTIONS.orders).doc(orderId).get()
+    ).data();
+    if (readPath(order || {}, 'source.merchantId', '') !== merchant.merchantId)
+      throw new ForbiddenException('Order does not belong to this merchant');
+    requireLegacyBidFlow(order);
+    const lockRef = this.firebase.db.collection('checkoutLocks').doc(orderId),
+      token = randomUUID();
+    await this.firebase.db.runTransaction(async (tx) => {
+      const lock = (await tx.get(lockRef)).data();
+      if (lock && Number(lock.expiresAt) > Date.now())
+        throw new ConflictException(
+          'Checkout is being updated. Retry in a moment.',
+        );
+      tx.set(lockRef, { token, expiresAt: Date.now() + 120000 });
+    });
+    try {
+      return await this.createBidCheckoutUnlocked(
+        merchant,
+        orderId,
+        bidId,
+        returnUrl,
+      );
+    } finally {
+      await this.firebase.db
+        .runTransaction(async (tx) => {
+          if ((await tx.get(lockRef)).data()?.token === token)
+            tx.delete(lockRef);
+        })
+        .catch(() => {});
+    }
+  }
+  private async createBidCheckoutUnlocked(
+    merchant: MerchantContext,
+    orderId: string,
+    bidId: string,
+    returnUrl: string,
+  ) {
     const orderRef = this.firebase.db
       .collection(COLLECTIONS.orders)
       .doc(orderId);
@@ -357,9 +539,30 @@ export class OrdersService {
     }
 
     const orderData = orderSnap.data() ?? {};
+    requireLegacyBidFlow(orderData);
     const orderMerchantId = readPath(orderData, 'source.merchantId', '');
     if (orderMerchantId !== merchant.merchantId) {
       throw new ForbiddenException('Order does not belong to this merchant');
+    }
+
+    const savedCheckout = readPath(orderData, 'payment.checkoutSessionId', '');
+    if (savedCheckout) {
+      const previous =
+        await this.getStripe().checkout.sessions.retrieve(savedCheckout);
+      if (previous.payment_status === 'paid')
+        throw new ConflictException('This order is already paid');
+      if (previous.status === 'open') {
+        if (readPath(orderData, 'payment.checkoutBidId', '') !== bidId)
+          throw new ConflictException(
+            'Another bid already has a checkout in progress',
+          );
+        return {
+          checkoutUrl: previous.url,
+          sessionId: previous.id,
+          orderId,
+          bidId,
+        };
+      }
     }
 
     const status = normalizeOrderStatus(orderData.status);
@@ -385,7 +588,7 @@ export class OrdersService {
       .collection(COLLECTIONS.driverProfiles)
       .doc(driverId)
       .get();
-    const driverData = driverSnap.data() ?? {};
+    const driverData = asRecord(driverSnap.data());
     const companyId = readPath(
       bidData,
       'company.id',
@@ -406,8 +609,8 @@ export class OrdersService {
         '',
       );
     }
-    if (!destinationAccountId) {
-      destinationAccountId = (driverData.stripeAccountId ?? '').toString();
+    if (!destinationAccountId && !companyId) {
+      destinationAccountId = asString(driverData.stripeAccountId);
     }
     if (!destinationAccountId) {
       throw new ConflictException(
@@ -417,12 +620,17 @@ export class OrdersService {
 
     const amountNok = Number(readPath(bidData, 'offer.amount', 0));
     const amountOre = Math.round(amountNok * 100);
-    if (!Number.isFinite(amountOre) || amountOre <= 0) {
+    if (
+      !Number.isSafeInteger(amountOre) ||
+      amountOre <= 0 ||
+      amountOre > 10000000
+    ) {
       throw new BadRequestException('Bid amount is invalid');
     }
 
-    const fixedFeeNok = this.config.get<number>('platform.fixedFeeNok', 29);
-    const percentFee = this.config.get<number>('platform.percentFee', 0.1);
+    const policy = await this.pricing.activePolicy();
+    const fixedFeeNok = policy.fees.fixedNok;
+    const percentFee = policy.fees.deliveryPercent / 100;
     const split = calculateDeliveryDistribution({
       totalOre: amountOre,
       platformFixedFeeOre: fixedFeeNok * 100,
@@ -439,48 +647,59 @@ export class OrdersService {
     const cancelUrl = `${returnUrl}${separator}payment=cancelled&orderId=${encodeURIComponent(orderId)}`;
 
     const stripe = this.getStripe();
-    const session = await stripe.checkout.sessions.create({
-      mode: 'payment',
-      success_url: successUrl,
-      cancel_url: cancelUrl,
-      line_items: [
-        {
-          quantity: 1,
-          price_data: {
-            currency: 'nok',
-            unit_amount: amountOre,
-            product_data: {
-              name: `SnapBudd delivery ${orderId.slice(0, 8).toUpperCase()}`,
-              description: `Driver bid from ${readPath(bidData, 'driver.name', 'Driver')}`,
+    if (split.distributableOre <= 0)
+      throw new ConflictException('Bid amount is too low for delivery fees');
+    const account = await stripe.accounts.retrieve(destinationAccountId);
+    if (!account.charges_enabled || !account.payouts_enabled)
+      throw new ConflictException('Company Stripe verification is incomplete');
+    const session = await stripe.checkout.sessions.create(
+      {
+        mode: 'payment',
+        payment_method_types: ['card'],
+        success_url: successUrl,
+        cancel_url: cancelUrl,
+        line_items: [
+          {
+            quantity: 1,
+            price_data: {
+              currency: 'nok',
+              unit_amount: amountOre,
+              product_data: {
+                name: `SnapBudd delivery ${orderId.slice(0, 8).toUpperCase()}`,
+                description: `Driver bid from ${readPath(bidData, 'driver.name', 'Driver')}`,
+              },
             },
           },
+        ],
+        payment_intent_data: {
+          application_fee_amount: split.platformFeeOre,
+          transfer_data: { destination: destinationAccountId },
+          metadata: {
+            orderId,
+            bidId,
+            driverId,
+            merchantId: merchant.merchantId,
+            companyId,
+            platformFeeOre: String(split.platformFeeOre),
+            distributableOre: String(split.distributableOre),
+            companyCommissionPercent: String(split.companyCommissionPercent),
+            companyEarningOre: String(split.companyEarningOre),
+            driverEarningOre: String(split.driverEarningOre),
+          },
         },
-      ],
-      payment_intent_data: {
-        application_fee_amount: split.platformFeeOre,
-        transfer_data: { destination: destinationAccountId },
         metadata: {
           orderId,
           bidId,
           driverId,
           merchantId: merchant.merchantId,
           companyId,
-          platformFeeOre: String(split.platformFeeOre),
-          distributableOre: String(split.distributableOre),
           companyCommissionPercent: String(split.companyCommissionPercent),
-          companyEarningOre: String(split.companyEarningOre),
-          driverEarningOre: String(split.driverEarningOre),
         },
       },
-      metadata: {
-        orderId,
-        bidId,
-        driverId,
-        merchantId: merchant.merchantId,
-        companyId,
-        companyCommissionPercent: String(split.companyCommissionPercent),
+      {
+        idempotencyKey: `merchant-delivery:${orderId}:${bidId}:${savedCheckout || 'initial'}:r${policy.revision}:c${split.companyCommissionPercent}`,
       },
-    });
+    );
 
     await orderRef.set(
       {
@@ -491,6 +710,10 @@ export class OrdersService {
           checkoutBidId: bidId,
           status: 'checkout_pending',
           totalOre: split.totalOre,
+          destinationAccountId,
+          destinationCompanyId: companyId || null,
+          pricingRevision: policy.revision,
+          feeRates: policy.fees,
           platformFeeOre: split.platformFeeOre,
           destinationNetOre: split.distributableOre,
           companyCommissionPercent: split.companyCommissionPercent,
@@ -520,21 +743,30 @@ export class OrdersService {
   }
 
   async rejectBid(merchant: MerchantContext, orderId: string, bidId: string) {
-    const orderRef = this.firebase.db.collection(COLLECTIONS.orders).doc(orderId);
+    const orderRef = this.firebase.db
+      .collection(COLLECTIONS.orders)
+      .doc(orderId);
     const bidRef = orderRef.collection(COLLECTIONS.bids).doc(bidId);
     await this.firebase.db.runTransaction(async (tx) => {
       const orderSnap = await tx.get(orderRef);
       if (!orderSnap.exists) throw new NotFoundException('Order not found');
       const order = orderSnap.data() ?? {};
+      requireLegacyBidFlow(order);
       if (readPath(order, 'source.merchantId', '') !== merchant.merchantId) {
         throw new ForbiddenException('Order does not belong to this merchant');
       }
       if (!OPEN_ORDER_STATUSES.has(normalizeOrderStatus(order.status))) {
         throw new ConflictException('Order is no longer open for bids');
       }
-      if (readPath(order, 'payment.checkoutBidId', '') === bidId &&
-          ['checkout_pending', 'paid'].includes(readPath(order, 'payment.status', ''))) {
-        throw new ConflictException('This bid has an active checkout; resolve payment before rejecting it');
+      if (
+        readPath(order, 'payment.checkoutBidId', '') === bidId &&
+        ['checkout_pending', 'paid'].includes(
+          readPath(order, 'payment.status', ''),
+        )
+      ) {
+        throw new ConflictException(
+          'This bid has an active checkout; resolve payment before rejecting it',
+        );
       }
       const bidSnap = await tx.get(bidRef);
       if (!bidSnap.exists) throw new NotFoundException('Bid not found');
@@ -544,10 +776,24 @@ export class OrdersService {
         throw new ConflictException('Bid is no longer active');
       }
       const now = this.firebase.serverTimestamp();
-      tx.set(bidRef, { status: 'rejected', rejectedAt: now, updatedAt: now,
-        rejectedByMerchantId: merchant.merchantId }, { merge: true });
-      tx.set(orderRef.collection('events').doc(), { type: 'bid_rejected', orderId, bidId,
-        actorRole: 'merchant', actorId: merchant.merchantId, createdAt: now });
+      tx.set(
+        bidRef,
+        {
+          status: 'rejected',
+          rejectedAt: now,
+          updatedAt: now,
+          rejectedByMerchantId: merchant.merchantId,
+        },
+        { merge: true },
+      );
+      tx.set(orderRef.collection('events').doc(), {
+        type: 'bid_rejected',
+        orderId,
+        bidId,
+        actorRole: 'merchant',
+        actorId: merchant.merchantId,
+        createdAt: now,
+      });
     });
     return { orderId, bidId, status: 'rejected' };
   }
@@ -558,16 +804,50 @@ export class OrdersService {
     bidId: string,
     sessionId: string,
   ) {
+    const ownedOrder = await this.getMerchantOrderOrThrow(
+      merchant.merchantId,
+      orderId,
+    );
+    requireLegacyBidFlow(ownedOrder.data);
     const stripe = this.getStripe();
     const session = await stripe.checkout.sessions.retrieve(sessionId);
     if (session.payment_status !== 'paid') {
       throw new ConflictException('Checkout payment is not completed yet');
     }
-    if (session.metadata?.merchantId !== merchant.merchantId ||
-        session.metadata?.orderId !== orderId || session.metadata?.bidId !== bidId) {
-      throw new ForbiddenException('Checkout session does not belong to this order and bid');
+    if (
+      session.metadata?.merchantId !== merchant.merchantId ||
+      session.metadata?.orderId !== orderId ||
+      session.metadata?.bidId !== bidId
+    ) {
+      throw new ForbiddenException(
+        'Checkout session does not belong to this order and bid',
+      );
     }
 
+    const intentId =
+      typeof session.payment_intent === 'string'
+        ? session.payment_intent
+        : session.payment_intent?.id;
+    if (!intentId)
+      throw new ConflictException('Checkout has no Stripe payment');
+    const intent = await stripe.paymentIntents.retrieve(intentId, {
+      expand: ['latest_charge.transfer'],
+    });
+    const charge =
+      typeof intent.latest_charge === 'object' ? intent.latest_charge : null;
+    if (
+      intent.status !== 'succeeded' ||
+      intent.currency !== 'nok' ||
+      !charge ||
+      charge.disputed ||
+      charge.amount_refunded > 0
+    )
+      throw new ConflictException(
+        'Payment requires verification or refund/dispute review',
+      );
+    const transfer = charge.transfer;
+    const transferId =
+      typeof transfer === 'string' ? transfer : transfer?.id || null;
     const orderRef = this.firebase.db
       .collection(COLLECTIONS.orders)
       .doc(orderId);
@@ -580,14 +860,32 @@ export class OrdersService {
       }
 
       const orderData = orderSnap.data() ?? {};
+      requireLegacyBidFlow(orderData);
       const orderMerchantId = readPath(orderData, 'source.merchantId', '');
       if (orderMerchantId !== merchant.merchantId) {
         throw new ForbiddenException('Order does not belong to this merchant');
       }
-      if (readPath(orderData, 'payment.checkoutSessionId', '') !== sessionId ||
-          readPath(orderData, 'payment.checkoutBidId', '') !== bidId ||
-          session.currency !== 'nok' || session.amount_total !== Number(readPath(orderData, 'payment.totalOre', '0'))) {
-        throw new ConflictException('Checkout session does not match the saved payment');
+      if (
+        readPath(orderData, 'payment.checkoutSessionId', '') !== sessionId ||
+        readPath(orderData, 'payment.checkoutBidId', '') !== bidId ||
+        intent.amount_received !==
+          Number(readPath(orderData, 'payment.totalOre', 0)) ||
+        intent.application_fee_amount !==
+          Number(readPath(orderData, 'payment.platformFeeOre', -1)) ||
+        (typeof intent.transfer_data?.destination === 'string'
+          ? intent.transfer_data.destination
+          : intent.transfer_data?.destination?.id) !==
+          readPath(orderData, 'payment.destinationAccountId', '') ||
+        intent.metadata?.orderId !== orderId ||
+        intent.metadata?.bidId !== bidId ||
+        intent.metadata?.merchantId !== merchant.merchantId ||
+        session.currency !== 'nok' ||
+        session.amount_total !==
+          Number(readPath(orderData, 'payment.totalOre', '0'))
+      ) {
+        throw new ConflictException(
+          'Checkout session does not match the saved payment',
+        );
       }
 
       const currentStatus = normalizeOrderStatus(orderData.status);
@@ -611,8 +909,13 @@ export class OrdersService {
       }
 
       const driverId = readPath(bidData, 'driver.id', bidId);
-      const companyId = readPath(bidData, 'company.id', '');
+      const companyId = readPath(orderData, 'payment.destinationCompanyId', '');
       const amount = Number(readPath(bidData, 'offer.amount', 0));
+      if (
+        Math.round(amount * 100) !== intent.amount_received ||
+        driverId !== intent.metadata?.driverId
+      )
+        throw new ConflictException('Paid bid details have changed');
       const now = this.firebase.serverTimestamp();
 
       tx.set(
@@ -620,7 +923,24 @@ export class OrdersService {
         {
           status: 'bid_accepted',
           paymentStatus: 'paid',
-          payment: { ...(orderData.payment as object), status: 'paid', paidAt: now, checkoutSessionId: sessionId },
+          payment: {
+            ...(orderData.payment as object),
+            status: 'paid',
+            paidAt: now,
+            checkoutSessionId: sessionId,
+            paymentIntentId: intent.id,
+            verifiedAt: now,
+            stripeChargeId: charge.id,
+            stripeTransferId: transferId,
+            transferStatus: transferId ? 'transferred' : 'pending',
+            receipt: {
+              ...asRecord(asRecord(orderData.payment).receipt),
+              url: charge.receipt_url,
+              number: charge.receipt_number,
+              chargeId: charge.id,
+              provider: 'stripe',
+            },
+          },
           assignment: {
             acceptedBidId: bidId,
             driverId,
@@ -699,12 +1019,12 @@ export class OrdersService {
   }
 
   private serializeOrder(id: string, data: Record<string, unknown>) {
-    const tracking = (data.tracking as Record<string, unknown>) ?? {};
-    const assignment = (data.assignment as Record<string, unknown>) ?? {};
-    const driver = (assignment.driver as Record<string, unknown>) ?? {};
-    const pricing = (data.pricing as Record<string, unknown>) ?? {};
-    const route = (data.route as Record<string, unknown>) ?? {};
-    const timeline = (data.timeline as Record<string, unknown>) ?? {};
+    const tracking = asRecord(data.tracking);
+    const assignment = asRecord(data.assignment);
+    const driver = asRecord(assignment.driver);
+    const pricing = asRecord(data.pricing);
+    const route = asRecord(data.route);
+    const timeline = asRecord(data.timeline);
     const merchantId = readPath(data, 'source.merchantId', '');
     const trackingBaseUrl = this.config.get<string>('merchantTrackingBaseUrl');
 
@@ -720,11 +1040,11 @@ export class OrdersService {
       merchantId,
       source: data.source ?? null,
       tracking: {
-        token: (tracking.publicToken ?? id).toString(),
+        token: asString(tracking.publicToken, id),
         url: this.buildTrackingUrl(
           merchantId,
           id,
-          (tracking.publicToken ?? id).toString(),
+          asString(tracking.publicToken, id),
           trackingBaseUrl,
         ),
         enabled: tracking.publicTrackingEnabled !== false,
@@ -735,6 +1055,7 @@ export class OrdersService {
       shipment: data.shipment ?? null,
       route,
       security: data.security ?? null,
+      pickupAuthorization: data.pickupAuthorization ?? null,
       ratings: data.ratings ?? null,
       schedule: data.schedule ?? null,
       scheduling: data.scheduling ?? null,

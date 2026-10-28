@@ -34,10 +34,10 @@ export class PortalController {
       throw new ForbiddenException('Merchant profile not found');
     }
 
-    const data = snap.data() ?? {};
-    const api = (data.api as Record<string, unknown>) ?? {};
-    const shop = (data.shop as Record<string, unknown>) ?? {};
-    const owner = (data.owner as Record<string, unknown>) ?? {};
+    const data = (snap.data() ?? {}) as Record<string, unknown>;
+    const api = asRecord(data.api);
+    const shop = asRecord(data.shop);
+    const owner = asRecord(data.owner);
 
     return {
       merchantId: user.merchantId,
@@ -63,8 +63,9 @@ export class PortalController {
       throw new ForbiddenException('Merchant profile not found');
     }
 
-    const data = snap.data() ?? {};
-    const status = (data.status ?? '').toString().toLowerCase();
+    const data = (snap.data() ?? {}) as Record<string, unknown>;
+    const status =
+      typeof data.status === 'string' ? data.status.toLowerCase() : '';
     if (status !== APPROVED_MERCHANT_STATUS) {
       throw new ForbiddenException(
         'API keys are available after your merchant account is approved',
@@ -92,8 +93,13 @@ export class PortalController {
       merchantId: user.merchantId,
       apiKey: key,
       apiKeyPrefix: prefix,
-      message:
-        'Store this API key securely. It will not be shown again.',
+      message: 'Store this API key securely. It will not be shown again.',
     };
   }
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
 }

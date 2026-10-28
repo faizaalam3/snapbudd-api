@@ -13,8 +13,7 @@ export default () => ({
   googleMapsApiKey: process.env.GOOGLE_MAPS_API_KEY ?? '',
   apiBaseUrl: process.env.API_BASE_URL ?? 'http://localhost:3000',
   merchantTrackingBaseUrl:
-    process.env.MERCHANT_TRACKING_BASE_URL ??
-    'https://snapbudd.io/track',
+    process.env.MERCHANT_TRACKING_BASE_URL ?? 'https://snapbudd.io/track',
   corsOrigins: (process.env.CORS_ORIGINS ?? '*')
     .split(',')
     .map((o) => o.trim())
