@@ -29,7 +29,7 @@ export class FirebaseAuthGuard implements CanActivate {
 
     let uid: string;
     try {
-      const decoded = await this.firebase.auth.verifyIdToken(token);
+      const decoded = await this.firebase.auth.verifyIdToken(token, true);
       uid = decoded.uid;
     } catch (error) {
       const code = this.safeErrorCode(error);
@@ -40,6 +40,7 @@ export class FirebaseAuthGuard implements CanActivate {
           'auth/id-token-expired',
           'auth/id-token-revoked',
           'auth/user-disabled',
+          'auth/user-not-found',
         ].includes(code)
       ) {
         this.logger.warn(`Firebase token verification failed (${code})`);

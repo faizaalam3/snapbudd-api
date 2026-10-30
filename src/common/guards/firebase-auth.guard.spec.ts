@@ -33,7 +33,7 @@ function setup(
   const context = {
     switchToHttp: () => ({ getRequest: () => request }),
   } as unknown as ExecutionContext;
-  return { guard, context, request, get };
+  return { guard, context, request, get, verifyIdToken };
 }
 
 function toError(value: unknown): Error {
@@ -55,10 +55,18 @@ describe('Firebase portal authentication', () => {
   it('allows a verified sign-in with active merchant membership', async () => {
     const f = setup();
     await expect(f.guard.canActivate(f.context)).resolves.toBe(true);
+    expect(f.verifyIdToken).toHaveBeenCalledWith('example-token', true);
     expect(f.request).toHaveProperty('firebaseUser', {
       uid: 'owner',
       merchantId: 'shop',
     });
+  });
+  it('rejects deleted users even when their old token has not expired', async () => {
+    const f = setup({ code: 'auth/user-not-found' });
+    await expect(f.guard.canActivate(f.context)).rejects.toBeInstanceOf(
+      UnauthorizedException,
+    );
+    expect(f.get).not.toHaveBeenCalled();
   });
   it('rejects expired tokens as authentication failures', async () => {
     const f = setup({ code: 'auth/id-token-expired' });
