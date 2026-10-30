@@ -87,15 +87,11 @@ export class MerchantApiKeyGuard implements CanActivate {
     (request as Request & { merchant: MerchantContext }).merchant =
       merchantContext;
 
-    await merchantSnap.ref.set(
-      {
-        api: {
-          lastUsedAt: this.firebase.serverTimestamp(),
-        },
-        updatedAt: this.firebase.serverTimestamp(),
-      },
-      { merge: true },
-    );
+    // Never recreate a profile concurrently removed by the administrator.
+    await merchantSnap.ref.update({
+      'api.lastUsedAt': this.firebase.serverTimestamp(),
+      updatedAt: this.firebase.serverTimestamp(),
+    });
 
     return true;
   }
