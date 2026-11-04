@@ -33,7 +33,11 @@ export class MerchantApiKeyGuard implements CanActivate {
     const merchantId = this.readHeader(request, 'x-merchant-id');
     const apiKey = this.readHeader(request, 'x-api-key');
 
-    if (!merchantId || !apiKey) {
+    if (
+      !/^[a-zA-Z0-9_-]{1,128}$/.test(merchantId) ||
+      !apiKey ||
+      apiKey.length > 512
+    ) {
       throw new UnauthorizedException(
         'X-Merchant-Id and X-Api-Key headers are required',
       );
@@ -49,6 +53,10 @@ export class MerchantApiKeyGuard implements CanActivate {
     }
 
     const merchant = asRecord(merchantSnap.data());
+    if (merchant.restaurantMigration)
+      throw new ForbiddenException(
+        'This business has moved to its shop workspace',
+      );
     const status = asString(merchant.status).toLowerCase();
     if (status !== APPROVED_MERCHANT_STATUS) {
       throw new ForbiddenException(

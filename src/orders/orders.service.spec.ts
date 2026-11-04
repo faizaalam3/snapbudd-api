@@ -333,6 +333,8 @@ describe('new fixed-price merchant requests', () => {
         runTransaction: async (fn: (tx: unknown) => Promise<void>) =>
           fn({
             get: async () => ({ data: () => ({ status: 'approved' }) }),
+            create: (ref: { id: string }, data: Record<string, unknown>) =>
+              writes.push({ id: ref.id, data }),
             set: (ref: { id: string }, data: Record<string, unknown>) =>
               writes.push({ id: ref.id, data }),
           }),
@@ -374,6 +376,7 @@ describe('new fixed-price merchant requests', () => {
       pickupContact: { name: 'Pickup', phone: '+4791234567' },
       dropoffContact: { name: 'Dropoff', phone: '+4791234567' },
       itemDescription: 'Parcel',
+      receiptUrl: 'https://example.test/receipt',
       pickupAuthorizationGranted: true,
     };
     return { service, writes, dto, policy };

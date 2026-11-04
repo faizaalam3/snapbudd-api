@@ -50,13 +50,16 @@ function fixture(
     collection: () => ({ doc: () => ({ id: 'event', set: async () => {} }) }),
   };
   const transaction = {
-    get: jest.fn(async () => ({
-      exists: true,
+    get: jest.fn(async (ref: { tracking?: boolean }) => ({
+      exists: !ref.tracking,
       data: () =>
         transaction.get.mock.calls.length === 1
           ? { status: 'approved' }
           : current,
     })),
+    create: (ref: unknown, data: Record<string, unknown>) => {
+      writes.push({ ref, data });
+    },
     set: (ref: unknown, data: Record<string, unknown>) => {
       writes.push({ ref, data });
     },
@@ -66,7 +69,12 @@ function fixture(
     increment: (amount: number) => amount,
     db: {
       collection: (name: string) => ({
-        doc: name === 'merchantprofiles' ? merchantDoc : () => orderRef,
+        doc:
+          name === 'merchantprofiles'
+            ? merchantDoc
+            : name === 'trackingReferences'
+              ? () => ({ tracking: true })
+              : () => orderRef,
       }),
       runTransaction: async (
         callback: (tx: typeof transaction) => Promise<void>,
@@ -78,8 +86,9 @@ function fixture(
       pickup: { lat: 59.91, lng: 10.75 },
       dropoff: { lat: 59.92, lng: 10.76 },
       route: {},
-      pricing: { total: 100 },
+      pricing: { total: 100, pricingRevision: 1 },
     })),
+    activePolicy: async () => ({ revision: 1 }),
     generateDropoffPin: () => '1234',
   };
   const area = {
@@ -128,7 +137,9 @@ describe('outlet order creation', () => {
     expect(area.validateOrderStops).toHaveBeenCalledWith(
       expect.objectContaining({ pickupCity: 'Oslo' }),
     );
-    expect(writes[0].data.source).toMatchObject({
+    expect(
+      writes.find((write) => write.data.schemaVersion === 3)!.data.source,
+    ).toMatchObject({
       outletId: 'central',
       outletName: 'Central',
     });
@@ -155,11 +166,13 @@ describe('outlet order creation', () => {
       pickup: undefined,
       pickupContact: undefined,
     } as unknown as CreateOrderDto);
-    expect(writes[0].data.pickup).toMatchObject({
+    expect(
+      writes.find((write) => write.data.schemaVersion === 3)!.data.pickup,
+    ).toMatchObject({
       address: { formatted: 'Saved address' },
       contact: { name: 'Manager', phone: '+4712345678' },
     });
-    expect(writes).toHaveLength(4);
+    expect(writes).toHaveLength(5);
   });
   it.each([
     null,
@@ -185,7 +198,9 @@ describe('outlet order creation', () => {
         pickupLng: 2,
       }),
     );
-    expect(writes[0].data.source).toMatchObject({
+    expect(
+      writes.find((write) => write.data.schemaVersion === 3)!.data.source,
+    ).toMatchObject({
       outletId: null,
       outletName: null,
     });

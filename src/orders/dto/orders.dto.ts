@@ -1,5 +1,6 @@
 import {
   IsBoolean,
+  IsEmail,
   Equals,
   IsDefined,
   IsISO8601,
@@ -38,6 +39,11 @@ export enum VehicleType {
 }
 
 class ContactDto {
+  @IsOptional()
+  @IsEmail()
+  @MaxLength(254)
+  email?: string;
+
   @IsString()
   @IsNotEmpty()
   @MaxLength(120)
@@ -106,6 +112,15 @@ class AddressDto {
 
 export class CreateOrderDto {
   @IsOptional()
+  @IsBoolean()
+  selectNearestOutlet?: boolean;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(128)
+  externalOrderId?: string;
+
+  @IsOptional()
   @IsString()
   @Matches(/^[a-zA-Z0-9_-]{1,128}$/)
   outletId?: string;
@@ -119,7 +134,9 @@ export class CreateOrderDto {
   pickupAuthorizationGranted!: boolean;
 
   @ValidateIf(
-    (input: CreateOrderDto) => !input.outletId || input.pickup !== undefined,
+    (input: CreateOrderDto) =>
+      (!input.outletId && !input.selectNearestOutlet) ||
+      input.pickup !== undefined,
   )
   @IsDefined()
   @ValidateNested()
@@ -133,7 +150,8 @@ export class CreateOrderDto {
 
   @ValidateIf(
     (input: CreateOrderDto) =>
-      !input.outletId || input.pickupContact !== undefined,
+      (!input.outletId && !input.selectNearestOutlet) ||
+      input.pickupContact !== undefined,
   )
   @IsDefined()
   @ValidateNested()

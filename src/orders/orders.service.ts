@@ -1,3 +1,8 @@
+import {
+  nearestOutlet,
+  requestHash,
+  trackingReference,
+} from './order-integration';
 import { randomUUID } from 'node:crypto';
 import {
   BadRequestException,
@@ -106,7 +111,104 @@ export class OrdersService {
       .sort((a, b) => String(a['name']).localeCompare(String(b['name'])));
   }
 
-  async createOrder(merchant: MerchantContext, dto: CreateOrderDto) {
+  async listOrders(merchant: MerchantContext, after?: string) {
+    if (after && !/^[a-zA-Z0-9_-]{1,128}$/.test(after))
+      throw new BadRequestException('Invalid pagination cursor');
+    let query = this.firebase.db
+      .collection(COLLECTIONS.orders)
+      .where('source.merchantId', '==', merchant.merchantId)
+      .orderBy('__name__')
+      .limit(101);
+    if (after) query = query.startAfter(after);
+    const page = await query.get();
+    return {
+      orders: page.docs
+        .slice(0, 100)
+        .map((doc) => this.serializeOrder(doc.id, doc.data())),
+      nextCursor: page.docs.length > 100 ? page.docs[99].id : null,
+    };
+  }
+
+  private creationResponse(id: string, data: Record<string, unknown>) {
+    const tracking = asRecord(data.tracking),
+      pricing = asRecord(data.pricing),
+      route = asRecord(data.route);
+    const reference = asString(tracking.reference);
+    return {
+      orderId: id,
+      status: data.status,
+      trackingId: reference || null,
+      trackingToken: asString(tracking.publicToken, id),
+      trackingUrl: reference
+        ? this.referenceUrl(reference)
+        : this.buildTrackingUrl(
+            readPath(data, 'source.merchantId'),
+            id,
+            id,
+            this.config.get<string>('merchantTrackingBaseUrl'),
+          ),
+      outletId: readPath(data, 'source.outletId') || null,
+      pricing: {
+        currency: pricing.currency,
+        total: pricing.total,
+        distanceKm: route.distanceKm,
+        durationMin: route.durationMin,
+      },
+    };
+  }
+
+  private referenceUrl(reference: string) {
+    const url = new URL(
+      this.config.get<string>('merchantTrackingBaseUrl') ||
+        'https://snapbudd.io/track',
+    );
+    url.search = '';
+    url.pathname = url.pathname.replace(/\/$/, '') + '/' + reference;
+    return url.toString();
+  }
+
+  async createOrder(
+    merchant: MerchantContext,
+    dto: CreateOrderDto,
+    idempotencyKey?: string,
+  ) {
+    if (
+      idempotencyKey !== undefined &&
+      !/^[a-zA-Z0-9_-]{8,128}$/.test(idempotencyKey)
+    )
+      throw new BadRequestException(
+        'Idempotency-Key must contain 8–128 letters, digits, underscores or hyphens',
+      );
+    const fingerprint = requestHash(dto);
+    const orderRef = idempotencyKey
+      ? this.firebase.db
+          .collection(COLLECTIONS.orders)
+          .doc('api_' + requestHash([merchant.merchantId, idempotencyKey]))
+      : this.firebase.db.collection(COLLECTIONS.orders).doc();
+    const replay = (data: Record<string, unknown>) => {
+      if (readPath(data, 'integration.requestHash') !== fingerprint)
+        throw new ConflictException(
+          'Idempotency-Key was already used with different order details',
+        );
+      return this.creationResponse(orderRef.id, data);
+    };
+    if (idempotencyKey) {
+      const existing = await orderRef.get();
+      if (existing.exists) return replay(existing.data()!);
+    }
+    if (dto.selectNearestOutlet && dto.outletId)
+      throw new BadRequestException(
+        'Use either outletId or selectNearestOutlet',
+      );
+    if (dto.selectNearestOutlet)
+      dto = {
+        ...dto,
+        outletId: nearestOutlet(
+          await this.listOutlets(merchant),
+          dto.dropoff.lat,
+          dto.dropoff.lng,
+        ),
+      };
     let outlet: Record<string, unknown> | undefined;
     let outletRef: FirebaseFirestore.DocumentReference | undefined;
     if (dto.outletId) {
@@ -216,8 +318,10 @@ export class OrdersService {
       dropoffCountryCode: dto.dropoff.countryCode,
     });
 
-    const customerName = dto.customer?.name?.trim() ?? '';
-    const customerPhone = dto.customer?.phone?.trim() ?? '';
+    const customerName =
+      dto.customer?.name?.trim() || dto.dropoffContact.name.trim();
+    const customerPhone =
+      dto.customer?.phone?.trim() || dto.dropoffContact.phone.trim();
     // New requests use the canonical posted price; offers are legacy-only.
     const finalTotal = preview.pricing.total;
     const negotiatedTotal = null;
@@ -229,7 +333,6 @@ export class OrdersService {
     if (preview.pricing.pricingRevision !== policy.revision)
       throw new ConflictException('Pricing changed. Request a new quote.');
     const dropoffPin = this.pricing.generateDropoffPin();
-    const orderRef = this.firebase.db.collection(COLLECTIONS.orders).doc();
     const now = this.firebase.serverTimestamp();
     const scheduledAt = dto.scheduledAt ? new Date(dto.scheduledAt) : null;
     if (scheduledAt && Number.isNaN(scheduledAt.getTime())) {
@@ -241,6 +344,10 @@ export class OrdersService {
     const orderDoc = {
       id: orderRef.id,
       schemaVersion: 3,
+      integration: {
+        requestHash: fingerprint,
+        externalOrderId: dto.externalOrderId || null,
+      },
       status: 'payment_pending',
       createdAt: now,
       updatedAt: now,
@@ -262,6 +369,7 @@ export class OrdersService {
         id: '',
         name: customerName,
         phone: customerPhone,
+        email: dto.customer?.email || dto.dropoffContact.email || null,
       },
       pickup: {
         location: preview.pickup,
@@ -300,6 +408,7 @@ export class OrdersService {
         contact: {
           name: dto.dropoffContact.name,
           phone: dto.dropoffContact.phone,
+          email: dto.dropoffContact.email || null,
         },
       },
       shipment: {
@@ -370,6 +479,7 @@ export class OrdersService {
         negotiatedTotal,
       },
       tracking: {
+        reference: '',
         publicToken: orderRef.id,
         publicTrackingEnabled: true,
       },
@@ -379,7 +489,14 @@ export class OrdersService {
     const secretRef = this.firebase.db
       .collection(COLLECTIONS.orderSecrets)
       .doc(orderRef.id);
-    await this.firebase.db.runTransaction(async (tx) => {
+    const committed = await this.firebase.db.runTransaction(async (tx) => {
+      if (idempotencyKey) {
+        const existing = await tx.get(orderRef);
+        if (existing.exists) {
+          replay(existing.data()!);
+          return existing.data()!;
+        }
+      }
       const currentMerchant = await tx.get(merchantSnap.ref);
       if (currentMerchant.data()?.status !== 'approved')
         throw new ForbiddenException('Merchant account is no longer approved');
@@ -410,6 +527,25 @@ export class OrdersService {
           );
         }
       }
+      let reference = '',
+        referenceRef: FirebaseFirestore.DocumentReference | undefined;
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const candidate = trackingReference();
+        const candidateRef = this.firebase.db
+          .collection('trackingReferences')
+          .doc(candidate);
+        if (!(await tx.get(candidateRef)).exists) {
+          reference = candidate;
+          referenceRef = candidateRef;
+          break;
+        }
+      }
+      if (!referenceRef)
+        throw new ConflictException(
+          'Could not reserve tracking ID. Retry with the same Idempotency-Key.',
+        );
+      orderDoc.tracking.reference = reference;
+      tx.create(referenceRef, { orderId: orderRef.id, collection: 'orders' });
       // Order, PIN, event and merchant count commit together. A failed auxiliary
       // write must not leave a created order that the caller might retry.
       tx.set(orderRef, orderDoc);
@@ -438,28 +574,10 @@ export class OrdersService {
         },
         { merge: true },
       );
+      return orderDoc;
     });
 
-    const trackingBaseUrl = this.config.get<string>('merchantTrackingBaseUrl');
-    const trackingUrl = this.buildTrackingUrl(
-      merchant.merchantId,
-      orderRef.id,
-      orderRef.id,
-      trackingBaseUrl,
-    );
-
-    return {
-      orderId: orderRef.id,
-      status: orderDoc.status,
-      trackingToken: orderRef.id,
-      trackingUrl,
-      pricing: {
-        currency: preview.pricing.currency,
-        total: finalTotal,
-        distanceKm: preview.route.distanceKm,
-        durationMin: preview.route.durationMin,
-      },
-    };
+    return this.creationResponse(orderRef.id, committed);
   }
 
   async getOrder(merchant: MerchantContext, orderId: string) {
@@ -1003,6 +1121,8 @@ export class OrdersService {
   }
 
   private async getMerchantOrderOrThrow(merchantId: string, orderId: string) {
+    if (!/^[a-zA-Z0-9_-]{1,128}$/.test(orderId))
+      throw new BadRequestException('Invalid order ID');
     const snap = await this.firebase.db
       .collection(COLLECTIONS.orders)
       .doc(orderId)
@@ -1030,6 +1150,8 @@ export class OrdersService {
 
     return {
       orderId: id,
+      externalOrderId: readPath(data, 'integration.externalOrderId') || null,
+      trackingId: tracking.reference || null,
       status: data.status,
       schemaVersion: data.schemaVersion ?? 2,
       createdAt: data.createdAt,
@@ -1041,12 +1163,15 @@ export class OrdersService {
       source: data.source ?? null,
       tracking: {
         token: asString(tracking.publicToken, id),
-        url: this.buildTrackingUrl(
-          merchantId,
-          id,
-          asString(tracking.publicToken, id),
-          trackingBaseUrl,
-        ),
+        reference: tracking.reference || null,
+        url: tracking.reference
+          ? this.referenceUrl(asString(tracking.reference))
+          : this.buildTrackingUrl(
+              merchantId,
+              id,
+              asString(tracking.publicToken, id),
+              trackingBaseUrl,
+            ),
         enabled: tracking.publicTrackingEnabled !== false,
       },
       customer: data.customer ?? null,
