@@ -1,3 +1,4 @@
+import { MerchantPaymentService } from './merchant-payment.service';
 import { Module } from '@nestjs/common';
 import { OrdersController } from './orders.controller';
 import { OrdersService } from './orders.service';
@@ -6,6 +7,11 @@ import { ServiceAreaService } from '../service-area/service-area.service';
 
 @Module({
   controllers: [OrdersController],
-  providers: [OrdersService, PricingService, ServiceAreaService],
+  providers: [
+    MerchantPaymentService,
+    OrdersService,
+    PricingService,
+    ServiceAreaService,
+  ],
 })
 export class OrdersModule {}

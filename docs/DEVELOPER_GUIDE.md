@@ -1,270 +1,119 @@
-# SnapBudd Merchant API — Developer Guide
+# Merchant website delivery integration
 
-This guide is for developers integrating SnapBudd delivery into a shop website.
+New deliveries use a fixed server-calculated price. Payment is verified before publication; an eligible driver accepts without bidding. This document describes the updated source contract. Deploy the API and payment function before enabling it on a live website.
 
-## Prerequisites
+## Account and connection
 
-1. **Merchant account** — Register at the SnapBudd Merchant Portal
-2. **Admin approval** — Your business profile must be approved
-3. **API credentials** — Generate from Merchant Portal → **API access**
-4. **Backend integration** — Call the API from your server, not browser JavaScript
+Register at https://snapbudd.io/portal/?workspace=merchant, complete onboarding and obtain admin approval. Create outlets in **Outlets** and generate an API key in **API integration**. Store `X-Merchant-Id` and `X-Api-Key` on your backend. Authenticate your website's users and check their website-order ownership before forwarding requests.
 
-## Base URL
+A merchant account owns all its outlets and delivery orders. In-app shops use their separate shop workspace for products, purchases and outlets; a shop ID is not a merchant API ID. Do not share credentials across businesses.
 
-| Environment | URL |
-|-------------|-----|
-| Local | `http://localhost:3000` |
-| Production | `https://snapbudd-api.onrender.com` |
+Base URL: `https://snapbudd-api.onrender.com` (use your staging URL for testing).
 
-Verify the hosted API before integrating:
+| Method | Endpoint | Result |
+| --- | --- | --- |
+| GET | `/health` | Public service availability; does not test credentials |
+| GET | `/v1/orders/connection` | Authenticated merchant ID and capabilities |
+| GET | `/v1/orders/outlets` | Owned outlets; filter `active === true` |
+| GET | `/v1/orders?after=<nextCursor>` | All owned orders across outlets, 100 per page; stop when `nextCursor` is null |
+| POST | `/v1/orders` | Create unpaid delivery and immediate tracking reference |
+| POST | `/v1/orders/{orderId}/checkout` | Hosted Stripe checkout: `{returnUrl}` → `{url, sessionId, totalOre}` |
+| POST | `/v1/orders/{orderId}/payment` | Embedded Stripe payment: no body → `{clientSecret, paymentIntentId, totalOre}` or `{paid: true}` on a reconciled retry |
+| POST | `/v1/orders/{orderId}/payment/verify` | Verify the saved Stripe payment; no caller-supplied payment ID or amount |
+| GET | `/v1/orders/{orderId}` | Private order, payment, assignment and tracking details |
 
-```bash
-curl https://snapbudd-api.onrender.com/health
-```
+Except `/health`, these endpoints require both merchant headers. Bid endpoints remain for historical orders and reject new fixed-price payments.
 
-Expected response:
+## Customer checkout and pickup selection
 
-```json
-{
-  "status": "ok",
-  "service": "snapbudd-api",
-  "version": "1.0.0"
-}
-```
+Offer **SnapBudd delivery** at your website checkout. Collect recipient name, international-format phone, email if available, full delivery address, city, postal code, two-letter country code, and confirmed map coordinates. Keep billing and delivery addresses separate.
 
-## Authentication headers
+Request browser location permission only when the buyer clicks **Use my location**. Reverse-geocode the coordinates using your address provider and let the buyer confirm the address/pin. On denial, timeout or unsupported browsers, provide address search/manual entry. Do not silently replace an entered delivery address with device location.
 
-Every order API request must include:
+Choose one pickup mode:
+
+- `selectNearestOutlet: true` with numeric `dropoff.lat/lng`: the API chooses the nearest complete, active, owned outlet by straight-line distance to the confirmed delivery destination.
+- `outletId`: your backend chooses an owned active outlet, considering stock/opening hours. The API resolves its saved address and coordinates; caller pickup coordinates cannot override them.
+- Manual `pickup` and `pickupContact`: use a full address/contact instead of an outlet.
+
+Automatic distance selection does not check inventory or opening hours. Your website must do that, selecting an explicit outlet when required. Driving distance determines price. Both stops must pass the configured service-area checks. The selected outlet is rechecked transactionally before the order is committed; edits do not change historical order attribution.
+
+## Create once, retry safely
+
+Save a unique key and the exact request on your backend before sending. Reuse `Idempotency-Key` and the same body after a timeout. The key must contain 8–128 letters, digits, underscores or hyphens. A changed request with the same key returns 409; concurrent duplicates return one saved order. Without a key, creation is not retry-safe. `externalOrderId` is a business reference, not an idempotency guarantee.
 
 ```http
-X-Merchant-Id: <your_merchant_id>
-X-Api-Key: sb_live_<secret>
+POST /v1/orders
+X-Merchant-Id: YOUR_MERCHANT_ID
+X-Api-Key: YOUR_SECRET_KEY
+Idempotency-Key: website-order-123-delivery-v1
 Content-Type: application/json
 ```
 
-## Integration flow
-
-```mermaid
-sequenceDiagram
-  participant Shop as Shop Website
-  participant API as SnapBudd API
-  participant FS as Firestore
-  participant Driver as SnapBudd Drivers
-  participant Stripe as Stripe Checkout
-
-  Shop->>API: POST /v1/orders
-  API->>FS: Create order (status: bidding or scheduled)
-  API-->>Shop: orderId, trackingUrl (bidding or scheduled)
-
-  Driver->>FS: Place bids
-  Shop->>API: GET /v1/orders/{id}/bids
-  API-->>Shop: bid list
-
-  Shop->>API: POST .../bids/{bidId}/checkout
-  API->>Stripe: Create checkout session
-  API-->>Shop: checkoutUrl
-
-  Shop->>Stripe: Customer pays
-  Shop->>API: POST .../bids/{bidId}/finalize
-  API->>FS: Assign driver, reject other bids
-  API-->>Shop: Updated order
-
-  loop Tracking
-    Shop->>API: GET /v1/orders/{id}
-    API-->>Shop: status, driver, tracking URL
-  end
-```
-
-## 1. Create order
-
-### Rejecting a bid
-
-Send `POST /v1/orders/{orderId}/bids/{bidId}/reject` with merchant headers and no body. Response: `{ "orderId": "...", "bidId": "...", "status": "rejected" }`. Repeated rejection is idempotent. Other merchants' orders, closed orders and bids with active payment checkout are denied. This route requires the updated API deployment.
-
-### Verified finalization
-
-Finalization verifies Stripe session metadata (merchant/order/bid), saved checkout ID, bid ID, currency and payment amount. A return URL alone is not payment proof. Authenticate the shop user and compare the returned session with the one saved on your backend. Never blindly retry create or checkout writes: the API has no idempotency-key contract. REST tracking URLs currently use the legacy tracking contract, not the portal's expiring share-link contract; verify its privacy-filtered public handler before sharing.
-
-**`POST /v1/orders`**
-
-### Required fields
-
-| Field | Type | Rules |
-|-------|------|-------|
-| `pickup.formatted` | string | Full pickup address |
-| `pickup.city` | string | City name (must be in service area) |
-| `pickup.countryCode` | string | ISO 2-letter code (e.g. `NO`) |
-| `dropoff.formatted` | string | Full dropoff address |
-| `dropoff.city` | string | City name |
-| `dropoff.countryCode` | string | ISO 2-letter code |
-| `pickupContact.name` | string | Max 120 chars |
-| `pickupContact.phone` | string | Max 40 chars |
-| `dropoffContact.name` | string | Max 120 chars |
-| `dropoffContact.phone` | string | Max 40 chars |
-| `itemDescription` | string | Min 5, max 500 chars |
-| `receiptUrl` | string | HTTPS URL to order receipt |
-
-### Optional fields
-
-| Field | Type | Default |
-|-------|------|---------|
-| `customer.name` | string | `""` |
-| `customer.phone` | string | `""` |
-| `packageSize` | `Small` \| `Medium` \| `Large` | `Medium` |
-| `packageType` | `General` \| `Documents` \| `Food` \| `Fragile` | `General` |
-| `vehicleType` | `Car` \| `Van` | `Car` |
-| `fragile` | boolean | `false` |
-| `requiresSignature` | boolean | `false` |
-| `contactless` | boolean | `false` |
-| `returnToShop` | boolean | `false` |
-| `notes` | string | `""` |
-| `amount` | number | Auto-calculated total (NOK) |
-| `scheduledAt` | string | ISO-8601 datetime |
-| `pickup.lat`, `pickup.lng` | number | Geocoded from address |
-| `dropoff.lat`, `dropoff.lng` | number | Geocoded from address |
-
-### Example request
-
-```bash
-curl -X POST https://snapbudd-api.onrender.com/v1/orders \
-  -H "X-Merchant-Id: YOUR_MERCHANT_ID" \
-  -H "X-Api-Key: sb_live_YOUR_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "pickup": {
-      "formatted": "Karl Johans gate 1, 0154 Oslo",
-      "city": "Oslo",
-      "countryCode": "NO",
-      "lat": 59.9139,
-      "lng": 10.7522
-    },
-    "dropoff": {
-      "formatted": "Aker Brygge 10, 0250 Oslo",
-      "city": "Oslo",
-      "countryCode": "NO"
-    },
-    "pickupContact": { "name": "Shop Desk", "phone": "+4712345678" },
-    "dropoffContact": { "name": "Ola Nordmann", "phone": "+4798765432" },
-    "itemDescription": "Blue winter jacket size M",
-    "receiptUrl": "https://your-shop.com/receipts/order-123.pdf"
-  }'
-```
-
-### Example response (`201`)
-
 ```json
 {
-  "orderId": "abc123xyz",
-  "status": "pending",
-  "trackingToken": "abc123xyz",
-  "trackingUrl": "https://snapbudd.io/merchant/track?merchantId=...&orderId=...&token=...",
-  "pricing": {
-    "currency": "NOK",
-    "total": 378.0,
-    "distanceKm": 2.4,
-    "durationMin": 8
-  }
+  "externalOrderId": "website-order-123",
+  "selectNearestOutlet": true,
+  "pickupAuthorizationGranted": true,
+  "dropoff": {
+    "formatted": "Aker Brygge 10, 0250 Oslo",
+    "city": "Oslo",
+    "postalCode": "0250",
+    "countryCode": "NO",
+    "lat": 59.9106,
+    "lng": 10.7281
+  },
+  "dropoffContact": {
+    "name": "Recipient name",
+    "phone": "+4798765432",
+    "email": "recipient@example.com"
+  },
+  "itemDescription": "Blue winter jacket, size M",
+  "receiptUrl": "https://your-shop.com/receipts/order-123.pdf",
+  "packageType": "General",
+  "packageSize": "Medium",
+  "vehicleType": "Car"
 }
 ```
 
-## 2. List bids
+Required: recipient address/city/countryCode, contact name/phone, item description (5–500 characters), receipt URL, explicit pickup authorization, and a pickup mode. Obtain consent/authority before setting `pickupAuthorizationGranted: true`; do not preselect it. Supply an accessible receipt without credentials embedded in the URL.
 
-**`GET /v1/orders/{orderId}/bids`**
+Optional: email, `customer` name/phone/email, `notes`, `fragile`, `requiresSignature`, `contactless`, `returnToShop`, `scheduledAt` (ISO timestamp), address street/state/postalCode/country/placeId. Package types: General/Documents/Food/Fragile; sizes: Small/Medium/Large; vehicles: Car/Van. Unknown fields are rejected. Omit `amount`: it is a legacy delivery-price assertion, not merchandise value.
 
-Returns active driver bids sorted by creation time.
+The response contains `orderId`, `trackingId` (10 characters), `trackingUrl`, selected `outletId`, `status: payment_pending`, and `pricing` with currency, total in NOK, route distance and duration. Save these against the website order. Display the reference immediately, clearly marked **Payment pending**. An order/reference is not proof of payment or dispatch.
 
-```json
-[
-  {
-    "bidId": "driver_uid",
-    "status": "active",
-    "offer": { "amount": 350, "currency": "NOK", "etaMin": 25 },
-    "driver": { "id": "...", "name": "...", "ratingAvg": 4.8 },
-    "vehicle": { "type": "Car", "plate": "AB12345" }
-  }
-]
+## Delivery funding
+
+Show the returned fixed price before the payer confirms. Select one payment mode per order:
+
+1. **Hosted checkout:** POST `/checkout` with `{"returnUrl":"https://your-shop.com/payment-return"}`. Save `sessionId`; redirect to returned `url`. The return includes `orderId`, `payment` and `session_id`.
+2. **Embedded payment:** POST `/payment`; confirm `clientSecret` with Stripe's client SDK and SnapBudd's publishable key for the matching environment. This is a SnapBudd payment intent, not one created on the merchant's Stripe account. Do not log the client secret or expose the API key.
+
+If the buyer pays delivery separately, they pay SnapBudd through this flow. If your website collects merchandise plus delivery in one buyer charge, fund the SnapBudd delivery from merchant funds through this flow and do not charge the buyer delivery twice. Your backend coordinates the two payments and handles failure/refund recovery. There is no atomic combined merchandise/delivery charge, automatic merchant-balance debit, or endpoint accepting an arbitrary claim of payment.
+
+After client confirmation, call POST `/payment/verify` from your authenticated backend. It validates the saved Stripe payment, amount, currency, generation, refunds and disputes. Then read the order:
+
+```js
+const delivery = await snapbudd(`/v1/orders/${orderId}`);
+const funded = delivery.payment.status === 'paid'
+  && !delivery.payment.reviewRequired
+  && !delivery.payment.refundedOre;
 ```
 
-## 3. Accept bid (checkout)
+Only verified funding publishes API deliveries. The existing Stripe webhook reconciles if the browser closes. Never trust return URL parameters. Repeat verification or poll with backoff. Retrying payment recovers its saved attempt; do not switch checkout modes or create another order to bypass an expired/closed attempt. A 409 needs reconciliation/support, not another charge.
 
-**`POST /v1/orders/{orderId}/bids/{bidId}/checkout`**
+## Assignment and tracking
 
-```json
-{ "returnUrl": "https://your-shop.com/orders/complete" }
-```
+Poll GET `/v1/orders/{orderId}` from the backend every 15–30 seconds with backoff. `assignment.driverId` is null before acceptance. Afterwards, authorized staff/buyers can view `driverName`, `driverPhone`, `driver.photoUrl` and `vehicle`.
 
-Response:
+Share only the returned `trackingUrl` (or `trackingId`) publicly. Anyone with the reference can view general progress; public tracking excludes exact addresses, contacts, private driver coordinates, receipts and PINs. Never proxy the private order response anonymously. `tracking.enabled` must be respected. Older orders may lack a reference and use their returned legacy link.
 
-```json
-{
-  "checkoutUrl": "https://checkout.stripe.com/...",
-  "sessionId": "cs_test_...",
-  "orderId": "...",
-  "bidId": "..."
-}
-```
+Stop normal polling at completed/cancelled/refunded/failed. `delivered` may still await PIN confirmation; `completed` is final. External status updates currently use polling, not merchant webhook subscriptions.
 
-Redirect your customer (or open in new tab) to `checkoutUrl`.
+## Deployment and acceptance
 
-## 4. Finalize bid acceptance
+Deploy the updated Nest API and the `merchantDeliveryPayment` Cloud Function with the existing fixed-delivery Stripe webhook, tracking and marketplace triggers. The API defaults to the `us-central1` payment function in `FIREBASE_PROJECT_ID`; set `MERCHANT_PAYMENT_URL` for a different region/project. The function requires its existing `STRIPE_SECRET_KEY` binding. Both services must use the same Firebase project and Stripe environment. Embedded payments also require the matching public Stripe key on the website; hosted checkout does not.
 
-After Stripe redirects back with `session_id`:
+Test in a separate staging project with Stripe test keys: connection approval/denial, all-outlet access, foreign-owner denial, nearest/manual pickup, location denial, duplicate/concurrent requests, price display, declined/paid checkout, closed browser, delayed webhook, driver acceptance, refunds, and public tracking privacy. Health alone does not prove payment or webhook deployment is working.
 
-**`POST /v1/orders/{orderId}/bids/{bidId}/finalize`**
-
-```json
-{ "sessionId": "cs_test_..." }
-```
-
-This assigns the driver and rejects other bids.
-
-## 5. Track order
-
-**`GET /v1/orders/{orderId}`**
-
-Returns status, assignment, pricing, timeline, and public tracking URL.
-
-### Order statuses
-
-| Status | Meaning |
-|--------|---------|
-| `pending` | Open for driver bids |
-| `bidding` | Customer order variant of open |
-| `bid_accepted` | Driver assigned after payment |
-| `pickup_started` | Driver en route to pickup |
-| `arrived` | At pickup or dropoff |
-| `picked_up` | Package collected |
-| `in_transit` | En route to dropoff |
-| `delivered` | Awaiting PIN confirmation |
-| `completed` | Delivery finished |
-| `cancelled` | Cancelled |
-
-## Error format
-
-```json
-{
-  "success": false,
-  "error": {
-    "code": "VALIDATION_ERROR",
-    "message": "Validation failed",
-    "details": ["itemDescription must be longer than or equal to 5 characters"]
-  }
-}
-```
-
-## Security notes
-
-- Store `X-Api-Key` in server environment variables only
-- Regenerate the key if it is ever exposed
-- Validate order data on your side before calling the API
-- Use HTTPS for all requests
-- Upload receipts to your own storage and pass a public HTTPS `receiptUrl`
-
-## Public tracking page
-
-Share the `trackingUrl` from create/track responses with end customers. It opens the SnapBudd merchant public tracking page without requiring login.
-
-## Support
-
-- Merchant Portal → **API guide** for live examples with your Merchant ID
-- Merchant Portal → **Tracking** for active deliveries
+Error handling: 400 validation; 401 credentials; 403 approval/ownership; 404 unknown resource/version; 409 reconcile state; 503 service interruption. Retry reads and the same keyed create/payment attempt with backoff. Never log secrets or private request bodies.

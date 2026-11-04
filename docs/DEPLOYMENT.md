@@ -119,7 +119,7 @@ docker run -p 3000:3000 --env-file .env snapbudd-api
 - [ ] Test `POST /v1/orders` with curl
 - [ ] Verify order appears in Firestore `orders` collection
 - [ ] Verify order is visible in SnapBudd driver app feed
-- [ ] Test bid checkout + finalize with Stripe test mode
+- [ ] Test fixed-price checkout/payment + payment/verify with Stripe test mode; deploy merchantDeliveryPayment and verify its webhook reconciliation
 - [ ] Set `CORS_ORIGINS` to your shop domains (avoid `*` in production)
 
 ## Merchant portal configuration

@@ -28,6 +28,7 @@ async function bootstrap() {
       'Authorization',
       'X-Merchant-Id',
       'X-Api-Key',
+      'Idempotency-Key',
     ],
   });
 

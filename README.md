@@ -1,6 +1,6 @@
 # SnapBudd Merchant API
 
-REST API for external shop websites to create delivery orders, list driver bids, accept bids via Stripe Checkout, and track order status.
+REST API for external shop websites to create fixed-price deliveries, select owned pickup outlets, verify delivery payment, receive tracking IDs and follow assigned drivers.
 
 Built with **NestJS 11** and **Firebase Admin SDK**, writing to the same Firestore collections used by the SnapBudd mobile app and merchant portal (`snapbudd-1`).
 
@@ -75,10 +75,11 @@ Authorization: Bearer <firebase_id_token>
 | `POST` | `/v1/orders` | Create order |
 | `GET` | `/v1/orders/outlets` | List your saved outlets (merchant API authentication) |
 | `GET` | `/v1/orders/:orderId` | Track order |
-| `GET` | `/v1/orders/:orderId/bids` | List bids |
-| `POST` | `/v1/orders/:orderId/bids/:bidId/checkout` | Start Stripe checkout |
-| `POST` | `/v1/orders/:orderId/bids/:bidId/reject` | Reject an active bid on an owned open order |
-| `POST` | `/v1/orders/:orderId/bids/:bidId/finalize` | Finalize after payment |
+| `GET` | `/v1/orders/connection` | Validate account/key and capabilities |
+| `GET` | `/v1/orders?after=<cursor>` | Paginate orders across all owned outlets |
+| `POST` | `/v1/orders/:orderId/checkout` | Fixed-price hosted checkout |
+| `POST` | `/v1/orders/:orderId/payment` | Fixed-price embedded payment |
+| `POST` | `/v1/orders/:orderId/payment/verify` | Verify saved Stripe funding |
 | `GET` | `/v1/portal/credentials` | Portal: view API credentials metadata |
 | `POST` | `/v1/portal/api-key/generate` | Portal: generate API key |
 
@@ -95,7 +96,9 @@ Pass `outletId` to `POST /v1/orders` instead of `pickup` and `pickupContact`.
 The API loads the outlet from your own merchant profile and uses its saved pickup
 location and contact. You may provide `pickupContact` to override the contact for
 this order; supplied pickup coordinates never override the selected outlet.
-Without `outletId`, the existing manual-address contract is unchanged.
+Alternatively send `selectNearestOutlet: true` with confirmed delivery coordinates. Without either selection, provide manual pickup details.
+
+Use `Idempotency-Key` for safe create retries. Creation returns an immediate 10-character `trackingId`; payment is required before publication. See the developer guide for funding and recovery.
 
 Orders retain `source.outletId` and `source.outletName` so editing or deactivating
 an outlet does not alter existing pickups. Reporting separates completed delivery
@@ -117,7 +120,7 @@ Use [docs/WEBSITE_DEVELOPER_HANDOFF.md](docs/WEBSITE_DEVELOPER_HANDOFF.md) when 
 
 ## Merchant onboarding flow
 
-1. Merchant signs up at **SnapBudd Merchant Portal** (`snapbudd_merchant`)
+1. Merchant signs up at https://snapbudd.io/portal/?workspace=merchant
 2. Creates workspace → submits business profile → admin approves in `snapbudd_admin`
 3. After approval, merchant opens **API access** to copy Merchant ID and generate API key
 4. Shop website backend calls this API (never expose the API key in frontend JS)
@@ -126,7 +129,7 @@ Use [docs/WEBSITE_DEVELOPER_HANDOFF.md](docs/WEBSITE_DEVELOPER_HANDOFF.md) when 
 
 ```
 src/
-  orders/          # Order create, track, bids, checkout
+  orders/          # Idempotent creation, outlets, tracking and fixed payment
   portal/          # API key management for merchant portal
   firebase/        # Firebase Admin initialization
   pricing/         # Route/pricing engine (matches merchant portal)
@@ -147,4 +150,4 @@ All create-order fields are validated with `class-validator` before any Firestor
 | `snapbudd_admin` | Admin approval |
 | `snapbudd_company` | Delivery company portal |
 
-This API does **not** modify those projects.
+Fixed payment routes use the shared Cloud Functions payment/reconciliation flow. Deploy `merchantDeliveryPayment` with this API; set `MERCHANT_PAYMENT_URL` when overriding its default project/region.

@@ -12,6 +12,9 @@ export default () => ({
   },
   googleMapsApiKey: process.env.GOOGLE_MAPS_API_KEY ?? '',
   apiBaseUrl: process.env.API_BASE_URL ?? 'http://localhost:3000',
+  merchantPaymentUrl:
+    process.env.MERCHANT_PAYMENT_URL ??
+    `https://us-central1-${process.env.FIREBASE_PROJECT_ID ?? 'snapbudd-1'}.cloudfunctions.net/merchantDeliveryPayment`,
   merchantTrackingBaseUrl:
     process.env.MERCHANT_TRACKING_BASE_URL ?? 'https://snapbudd.io/track',
   corsOrigins: (process.env.CORS_ORIGINS ?? '*')
